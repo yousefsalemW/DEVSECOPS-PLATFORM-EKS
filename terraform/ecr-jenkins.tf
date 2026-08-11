@@ -187,7 +187,7 @@ resource "aws_instance" "jenkins" {
 
   monitoring = true
 
-  disable_api_termination = true
+  #disable_api_termination = true
 
   instance_initiated_shutdown_behavior = "stop"
 

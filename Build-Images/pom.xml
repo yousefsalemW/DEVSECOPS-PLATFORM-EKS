@@ -1,0 +1,215 @@
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.visualpathit</groupId>
+    <artifactId>vprofile</artifactId>
+    <packaging>war</packaging>
+    <version>v2</version>
+    <name>Visualpathit VProfile Webapp</name>
+    <url>http://maven.apache.org</url>
+
+    <!--
+      ==========================================================================
+      SECURITY-HARDENED pom  (ceiling = Tomcat 9 / javax.*  → Spring 5.x max)
+      كل رقم اتغيّر معاه تعليق (old → new). لازم build + test بعده.
+      ملفات لازم تتغير معاه:
+        - appconfig-data.xml : dbcp → dbcp2 + dialect MySQL5 → MySQL8 (تحت)
+        - DAO/Repository code : لو بيستخدم findOne()/delete(id) → findById()/deleteById()
+        - appconfig-rabbitmq.xml : راجعه بعد ترقية spring-rabbit 1.7 → 2.4
+      ==========================================================================
+    -->
+    <properties>
+        <spring.version>5.3.39</spring.version>                     <!-- 4.2.0.RELEASE  → 5.3.39 -->
+        <spring-security.version>5.8.16</spring-security.version>   <!-- 4.0.2.RELEASE  → 5.8.16 -->
+        <spring-data-jpa.version>2.7.18</spring-data-jpa.version>   <!-- 1.8.2.RELEASE  → 2.7.18 -->
+        <hibernate.version>5.6.15.Final</hibernate.version>         <!-- 4.3.11.Final   → 5.6.15.Final -->
+        <hibernate-validator.version>6.2.5.Final</hibernate-validator.version> <!-- 5.2.1 → 6.2.5.Final -->
+        <mysql-connector.version>8.4.0</mysql-connector.version>   <!-- 8.0.22 → 8.0.33 -->
+        <commons-dbcp2.version>2.12.0</commons-dbcp2.version>       <!-- dbcp 1.4 → dbcp2 2.12.0 (artifact غيّر) -->
+        <jstl.version>1.2</jstl.version>
+        <junit.version>4.13.2</junit.version>                       <!-- 4.10 → 4.13.2 (test) -->
+        <logback.version>1.2.13</logback.version>                   <!-- 1.1.3 → 1.2.13 -->
+        <spring-rabbit.version>2.4.17</spring-rabbit.version>       <!-- 1.7.1.RELEASE → 2.4.17 -->
+        <amqp-client.version>5.21.0</amqp-client.version>           <!-- 4.0.2 → 5.21.0 -->
+        <gson.version>2.10.1</gson.version>                         <!-- 2.8.2 → 2.10.1 -->
+        <commons-io.version>2.16.1</commons-io.version>             <!-- 2.4 → 2.16.1 -->
+        <commons-fileupload.version>1.6.0</commons-fileupload.version> <!-- 1.3.1 → 1.5 -->
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <version>${spring.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <version>${spring.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-web</artifactId>
+            <version>${spring-security.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-config</artifactId>
+            <version>${spring-security.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.hibernate.validator</groupId>              <!-- كان org.hibernate (اتنقل لـ .validator) -->
+            <artifactId>hibernate-validator</artifactId>
+            <version>${hibernate-validator.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.data</groupId>
+            <artifactId>spring-data-jpa</artifactId>
+            <version>${spring-data-jpa.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.hibernate</groupId>
+            <artifactId>hibernate-core</artifactId>                 <!-- entitymanager اندمج في core من 5.5+ -->
+            <version>${hibernate.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${mysql-connector.version}</version>
+        </dependency>
+
+        <!-- override transitive protobuf من mysql-connector عشان CVE-2024-7254 -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>3.25.5</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.commons</groupId>                   <!-- commons-dbcp 1.4 → commons-dbcp2 -->
+            <artifactId>commons-dbcp2</artifactId>
+            <version>${commons-dbcp2.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>jstl</artifactId>
+            <version>${jstl.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-fileupload</groupId>
+            <artifactId>commons-fileupload</artifactId>
+            <version>${commons-fileupload.version}</version>
+        </dependency>
+
+        <!-- Memcached (net.spy) — 2.12.3 هي آخر إصدار (مشروع متوقّف). لو Trivy زنّ عليها اعملها ignore-unfixed -->
+        <dependency>
+            <groupId>net.spy</groupId>
+            <artifactId>spymemcached</artifactId>
+            <version>2.12.3</version>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>${commons-io.version}</version>
+        </dependency>
+
+        <!-- RabbitMQ -->
+        <dependency>
+            <groupId>org.springframework.amqp</groupId>
+            <artifactId>spring-rabbit</artifactId>
+            <version>${spring-rabbit.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>${amqp-client.version}</version>
+        </dependency>
+
+        <!-- gson -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>${gson.version}</version>
+        </dependency>
+
+        <!-- ===== test scope (مش بيدخل الـ WAR فمش بيظهر في Trivy image scan) ===== -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>4.11.0</version>                               <!-- 1.9.5 → 4.11.0 -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-test</artifactId>
+            <version>${spring.version}</version>                    <!-- 3.2.3 → 5.3.39 -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.hamcrest</groupId>
+            <artifactId>hamcrest</artifactId>                       <!-- hamcrest-all → hamcrest -->
+            <version>2.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>4.0.1</version>                                <!-- 3.1.0 → 4.0.1 (provided by Tomcat 9) -->
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>vprofile-v2</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>                            <!-- 3.2.2 → 3.4.0 -->
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.12</version>                           <!-- 0.8.4 → 0.8.12 -->
+                <executions>
+                    <execution>
+                        <id>jacoco-initialize</id>
+                        <phase>process-resources</phase>
+                        <goals><goal>prepare-agent</goal></goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-site</id>
+                        <phase>post-integration-test</phase>
+                        <goals><goal>report</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

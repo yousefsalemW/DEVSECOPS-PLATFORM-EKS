@@ -1,0 +1,18 @@
+# =====================================================================
+#  VProfile — Trivy accepted/ignored CVEs  (موثّق — ALnaqib)
+#  نستثني فقط: (أ) غير منطبقة فعليًا، أو (ب) مفيش fix على Tomcat 9/javax
+#  (يحتاج Jakarta/Spring 6 = Tomcat 10 = migration منفصل).
+# =====================================================================
+
+# (أ) غير منطبقة — HttpInvoker مش مستخدم في الـ app إطلاقًا
+CVE-2016-1000027   # spring-web  (fix في Spring 6.0/jakarta فقط)
+
+# (ب) مفيش fix متاح على السقف الحالي (EOL / javax)
+CVE-2026-0603      # hibernate-core 5.6.x — لا يوجد إصدار مُصلَّح (5.6.x EOL؛ الحل Hibernate 6/jakarta)
+
+# --- مقبولة ومتروكة ظاهرة في التقرير للشفافية (Spring core على javax) ---
+#   CVE-2026-22732  spring-security-web    (fix 6.5.9/7.0.4)
+#   CVE-2025-41249  spring-core            (fix 6.2.11)
+#   CVE-2024-38816  spring-webmvc          (fix 6.1.13)
+#   CVE-2024-38819  spring-webmvc          (fix 6.1.14)
+#   CVE-2025-22228  spring-security-crypto (fix 5.8.18 enterprise-only)

@@ -13,6 +13,9 @@ resource "aws_ecr_repository" "repos" {
 
   name                 = each.value
   image_tag_mutability = "IMMUTABLE"
+  force_delete = true
+# Allow full Terraform teardown by deleting images before the ECR repository.
+# This is intentional because the ECR repositories are fully managed by Terraform.
 
   image_scanning_configuration {
     scan_on_push = true

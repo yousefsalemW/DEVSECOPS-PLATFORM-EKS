@@ -57,6 +57,7 @@ retry apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
+  docker-compose-v2 \
   docker.io \
   git \
   gnupg \
@@ -84,6 +85,27 @@ JSON
 
 systemctl enable docker
 systemctl restart docker
+
+###############################################################################
+log "tuning kernel limits for SonarQube (embedded Elasticsearch)"
+###############################################################################
+# SonarQube bundles Elasticsearch, which refuses to start below these limits.
+# Written to /etc/sysctl.d so it survives reboots.
+cat > /etc/sysctl.d/99-sonarqube.conf <<'SYSCTL'
+vm.max_map_count=524288
+fs.file-max=131072
+SYSCTL
+# Apply only our file: "sysctl --system" re-applies every sysctl file on the
+# host, so one unrelated broken key elsewhere would abort the whole bootstrap.
+sysctl -q -p /etc/sysctl.d/99-sonarqube.conf || true
+
+# Then hard-fail only if the value we actually need did not take.
+mmc="$(sysctl -n vm.max_map_count)"
+if [ "${mmc}" -lt 524288 ]; then
+  log "vm.max_map_count is ${mmc}, need >= 524288 - SonarQube cannot start"
+  exit 1
+fi
+log "vm.max_map_count = ${mmc}"
 
 ###############################################################################
 log "installing Jenkins"
@@ -137,6 +159,62 @@ retry apt-get update
 apt-get install -y trivy
 
 ###############################################################################
+log "deploying SonarQube"
+###############################################################################
+# Community Build 26.x uses the embedded H2 database by default (the PostgreSQL
+# dependency was dropped in 26.2), so this is a single container - no DB service.
+# Heaps are capped on purpose: this box also runs Jenkins and the Docker builds,
+# and an unbounded Elasticsearch heap is what gets OOM-killed first.
+# Port is bound to loopback only - Jenkins talks to it over localhost, and you
+# reach the UI through an SSM port-forward, same as Jenkins on 8080.
+install -d -m 0755 /opt/sonarqube
+
+cat > /opt/sonarqube/docker-compose.yml <<'COMPOSE'
+services:
+  sonarqube:
+    image: sonarqube:26.8.0.126808-community
+    container_name: sonarqube
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      SONAR_WEB_JAVAOPTS: "-Xms256m -Xmx768m -Djava.security.egd=file:/dev/./urandom"
+      SONAR_CE_JAVAOPTS: "-Xms256m -Xmx768m"
+      SONAR_SEARCH_JAVAOPTS: "-Xms512m -Xmx1g"
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+      nproc: 8192
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+
+volumes:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+COMPOSE
+
+retry docker compose -f /opt/sonarqube/docker-compose.yml pull
+docker compose -f /opt/sonarqube/docker-compose.yml up -d
+
+# First start rebuilds the Elasticsearch index and takes a few minutes.
+# Deliberately non-fatal: a slow SonarQube must not fail the Jenkins bootstrap.
+log "waiting for SonarQube to report UP (up to 10 min)"
+for _ in $(seq 1 60); do
+  status="$(curl -fsS --max-time 5 http://localhost:9000/api/system/status 2>/dev/null \
+            | jq -r '.status' 2>/dev/null || true)"
+  if [ "${status}" = "UP" ]; then
+    log "SonarQube is UP"
+    break
+  fi
+  sleep 10
+done
+[ "${status:-}" = "UP" ] || log "WARNING: SonarQube not UP yet - check 'docker logs sonarqube'"
+
+###############################################################################
 log "wiring Jenkins up"
 ###############################################################################
 # Group membership does not reach an already-running process, and the Jenkins
@@ -147,6 +225,16 @@ usermod -aG docker jenkins
 # Pre-create the Trivy cache the pipeline points at (TRIVY_CACHE_DIR).
 install -d -m 0755 -o jenkins -g jenkins /var/lib/jenkins/.cache/trivy
 
+# Cap the Jenkins heap so it cannot compete with SonarQube for the 8 GB.
+# The Jenkins deb has not read /etc/default/jenkins since 2.332 - it is systemd
+# only, so the override has to go here.
+install -d -m 0755 /etc/systemd/system/jenkins.service.d
+cat > /etc/systemd/system/jenkins.service.d/override.conf <<'UNIT'
+[Service]
+Environment="JAVA_OPTS=-Xmx1536m -Djava.awt.headless=true"
+UNIT
+
+systemctl daemon-reload
 systemctl enable jenkins
 systemctl restart jenkins
 

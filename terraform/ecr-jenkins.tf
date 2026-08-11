@@ -175,7 +175,7 @@ resource "aws_instance" "jenkins" {
 
   ami           = "ami-015cabafc8f6249fe"
 
-  instance_type = "t3.medium"
+  instance_type = "m7i-flex.large"
 
   subnet_id = module.vpc.private_subnets[0]
 
@@ -204,13 +204,9 @@ resource "aws_instance" "jenkins" {
     instance_metadata_tags = "enabled"
   }
 
-  credit_specification {
-    cpu_credits = "standard"
-  }
-
   root_block_device {
 
-    volume_size = 30
+    volume_size = 80
 
     volume_type = "gp3"
 

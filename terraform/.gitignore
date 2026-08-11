@@ -1,0 +1,4 @@
+
+# Editor / local artifacts
+*.sw?
+*.deb

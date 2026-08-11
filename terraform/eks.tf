@@ -83,6 +83,18 @@ module "ebs_csi_role" {
     }
   }
 }
+resource "aws_security_group_rule" "jenkins_to_eks" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+
+  security_group_id        = module.eks.cluster_primary_security_group_id
+  source_security_group_id = aws_security_group.jenkins.id
+
+  description = "Allow Jenkins to access EKS API"
+}
+
 
 # الـ EBS CSI addon كـ resource مستقل — يكسر الـ dependency cycle مع module.eks
 resource "aws_eks_addon" "ebs_csi" {

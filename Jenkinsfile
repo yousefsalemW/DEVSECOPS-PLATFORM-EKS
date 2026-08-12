@@ -62,13 +62,22 @@ def mavenVerify() {
 // as its own container rather than as a maven goal in the build above.
 // --network host: SonarQube is bound to 127.0.0.1:9000 on this same instance.
 //
-// SONAR_USER_HOME: the image ships its cache at /opt/sonar-scanner/.sonar, owned
-// by the image's own uid 1000. Running with -u <jenkins uid> makes that path
-// unwritable and the scanner dies on startup with
-//   AccessDeniedException: /opt/sonar-scanner/.sonar/cache
-// So point SONAR_USER_HOME at a directory we own and bind-mount it from the
-// host — which also persists the downloaded scanner engine between builds
-// instead of re-fetching it every run.
+// Two paths inside this image are NOT writable by an arbitrary -u uid, and both
+// have to be redirected or the scanner dies before it analyses anything:
+//
+//   SONAR_USER_HOME         the image ships its cache at /opt/sonar-scanner/.sonar
+//                           owned by the image's own uid 1000 → AccessDenied on
+//                           /opt/sonar-scanner/.sonar/cache. Bind-mounted from the
+//                           host here, which also persists the downloaded scanner
+//                           engine + JRE between builds instead of re-fetching them.
+//   sonar.working.directory the image default is /tmp/.scannerwork, which already
+//                           exists in the image and is likewise not ours →
+//                           AccessDenied on /tmp/.scannerwork/.sonartmp.
+//                           Pointing it INTO the mounted workspace is what the
+//                           quality gate needs anyway: sonarQualityGate() reads
+//                           Build-Images/.scannerwork/report-task.txt from the
+//                           workspace, and anything written under /tmp would
+//                           vanish with --rm.
 def sonarScan() {
     withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
         sh """
@@ -82,6 +91,7 @@ def sonarScan() {
               -e SONAR_HOST_URL=${env.SONAR_HOST_URL} \
               -e SONAR_TOKEN=\${SONAR_TOKEN} \
               sonarsource/sonar-scanner-cli:latest \
+                -Dsonar.working.directory=/usr/src/.scannerwork \
                 -Dsonar.projectKey=${params.SONAR_PROJECT_KEY} \
                 -Dsonar.projectName=${params.SONAR_PROJECT_KEY} \
                 -Dsonar.projectVersion=${env.TAG} \

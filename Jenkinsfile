@@ -1,14 +1,15 @@
 // =============================================================================
-//  VProfile-Final — ECR Build/Scan/Push Pipeline
+//  DEVSECOPS-PLATFORM-EKS — Quality/Build/Scan/Push Pipeline
 //  ALnaqib · DevOps Engineer
 //
-//  Stages:  Init → Build → Trivy Scan (+ SBOM) → ECR Login → Tag → Push
-//           → Verify → Cleanup
+//  Stages:  Init → Maven Verify → SonarQube (+ quality gate) → Build
+//           → Trivy Scan (+ SBOM) → ECR Login → Tag → Push → Verify → Cleanup
 //
 //  Requirements on the Jenkins node:
 //    - docker with BuildKit (jenkins user in the docker group)
-//    - trivy
-//    - aws cli v2
+//    - trivy, jq, git, aws cli v2
+//    - SonarQube reachable on SONAR_HOST_URL (localhost:9000 on this box)
+//    - Jenkins credential 'sonar-token' (secret text) = a SonarQube user token
 //  ECR auth uses the instance profile (jenkins-ec2-role → ECR PowerUser),
 //  so no AWS credentials are stored in Jenkins.
 // =============================================================================
@@ -25,8 +26,8 @@ def IMAGES = [
 // -------- helpers -----------------------------------------------------------
 
 // Run a closure over every image, sequentially or in parallel.
-// NOTE: parallel build on a small agent (t3.medium = 2 vCPU / 4 GB) can OOM,
-// especially the Maven app image. Keep PARALLEL=false unless the agent is bigger.
+// NOTE: this box also runs SonarQube (~2.5 GB of JVM heap), so a parallel build
+// of the Maven app image is what gets OOM-killed first. Keep PARALLEL=false.
 def forEachImage(List images, boolean parallelMode, Closure body) {
     if (parallelMode) {
         parallel images.collectEntries { img -> ["${img.name}", { body(img) }] }
@@ -35,13 +36,107 @@ def forEachImage(List images, boolean parallelMode, Closure body) {
     }
 }
 
+// The app image compiles Maven INSIDE its own multi-stage Dockerfile, so the
+// Jenkins workspace never holds target/classes. SonarQube's Java analyser needs
+// that bytecode, so compile once here in the SAME JDK 11 image the Dockerfile
+// uses, and hand the output to the scanner.
+//   -u  : write build output as the jenkins user, not root, or the next
+//         workspace cleanup fails on root-owned files
+//   HOME/-Duser.home: required once we drop root, since /root/.m2 is unwritable
+def mavenVerify() {
+    sh """
+        mkdir -p ${env.MAVEN_CACHE}
+        docker run --rm \
+          -u \$(id -u):\$(id -g) \
+          -v "${env.WORKSPACE}/Build-Images":/src -w /src \
+          -v ${env.MAVEN_CACHE}:/var/maven/.m2 \
+          -e HOME=/var/maven \
+          -e MAVEN_CONFIG=/var/maven/.m2 \
+          -e MAVEN_OPTS="-Xmx1g" \
+          maven:3.9.9-eclipse-temurin-11 \
+          mvn -B -Duser.home=/var/maven ${params.SKIP_TESTS ? '-DskipTests' : ''} verify
+    """
+}
+
+// The scanner CLI needs Java 17+, while the app is built on Java 11 — so it runs
+// as its own container rather than as a maven goal in the build above.
+// --network host: SonarQube is bound to 127.0.0.1:9000 on this same instance.
+def sonarScan() {
+    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+        sh """
+            docker run --rm \
+              -u \$(id -u):\$(id -g) \
+              --network host \
+              -v "${env.WORKSPACE}/Build-Images":/usr/src \
+              -e SONAR_HOST_URL=${env.SONAR_HOST_URL} \
+              -e SONAR_TOKEN=\${SONAR_TOKEN} \
+              sonarsource/sonar-scanner-cli:latest \
+                -Dsonar.projectKey=${params.SONAR_PROJECT_KEY} \
+                -Dsonar.projectName=${params.SONAR_PROJECT_KEY} \
+                -Dsonar.projectVersion=${env.TAG} \
+                -Dsonar.sources=src/main \
+                -Dsonar.tests=src/test \
+                -Dsonar.java.binaries=target/classes \
+                -Dsonar.java.test.binaries=target/test-classes \
+                -Dsonar.junit.reportPaths=target/surefire-reports \
+                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+                -Dsonar.scm.revision=${env.GIT_SHA}
+        """
+    }
+}
+
+// Plugin-free quality gate: poll the Compute Engine task, then read the gate
+// verdict. Deliberately not using waitForQualityGate() so the pipeline needs no
+// Jenkins plugin and no SonarQube webhook back into Jenkins.
+def sonarQualityGate() {
+    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+        sh '''
+            set -eu
+            REPORT="Build-Images/.scannerwork/report-task.txt"
+            [ -f "${REPORT}" ] || { echo "no ${REPORT} — did the scan run?"; exit 1; }
+
+            TASK_ID=$(awk -F= '/^ceTaskId=/{print $2}' "${REPORT}")
+            echo "CE task: ${TASK_ID}"
+
+            STATUS=""
+            for _ in $(seq 1 60); do
+              STATUS=$(curl -sS -u "${SONAR_TOKEN}:" \
+                "${SONAR_HOST_URL}/api/ce/task?id=${TASK_ID}" | jq -r '.task.status')
+              echo "  analysis: ${STATUS}"
+              case "${STATUS}" in
+                SUCCESS)         break ;;
+                FAILED|CANCELED) echo "SonarQube analysis ${STATUS}"; exit 1 ;;
+              esac
+              sleep 5
+            done
+            [ "${STATUS}" = "SUCCESS" ] || { echo "timed out waiting for analysis"; exit 1; }
+
+            ANALYSIS_ID=$(curl -sS -u "${SONAR_TOKEN}:" \
+              "${SONAR_HOST_URL}/api/ce/task?id=${TASK_ID}" | jq -r '.task.analysisId')
+
+            GATE=$(curl -sS -u "${SONAR_TOKEN}:" \
+              "${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}" \
+              | jq -r '.projectStatus.status')
+
+            echo "===================================="
+            echo " QUALITY GATE: ${GATE}"
+            echo "===================================="
+            [ "${GATE}" = "OK" ]
+        '''
+    }
+}
+
 def buildImage(img) {
     echo "==> build ${img.name}:${env.TAG}"
     // --pull        : always fetch the latest base image (covers base-image CVEs)
     // BuildKit      : faster builds + better layer cache
     // OCI labels    : git sha / build date / version for audit & traceability
+    // MAVEN_HEAP    : caps the Maven JVM inside the app build. NOTE: docker's
+    //                 --memory flag is silently IGNORED under BuildKit, so the
+    //                 limit has to be applied to the JVM itself, not the builder.
     sh """
         DOCKER_BUILDKIT=1 docker build --pull \
+          --build-arg MAVEN_HEAP=${params.MAVEN_HEAP} \
           --label org.opencontainers.image.revision=${env.GIT_SHA} \
           --label org.opencontainers.image.created=${env.BUILD_DATE} \
           --label org.opencontainers.image.version=${env.TAG} \
@@ -58,14 +153,19 @@ def scanImage(img) {
 
     // (a) HIGH+CRITICAL report — archived as an artifact, never fails the build.
     //     --skip-db-update: DB was pre-warmed in Init, so no per-image download.
+    //     --ignorefile    : the accepted-risk list lives under Build-Images/, but
+    //                       trivy runs from the workspace root and would never
+    //                       find it on its own.
     sh """
         trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
+          --ignorefile ${env.TRIVY_IGNOREFILE} \
           --no-progress --ignore-unfixed --skip-db-update \
           --severity HIGH,CRITICAL --format table \
           --output trivy-${img.name}.txt ${ref}
     """
 
     // (b) SBOM in CycloneDX format — archived per image.
+    //     No ignorefile here on purpose: an SBOM must list every component.
     sh """
         trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
           --no-progress --skip-db-update \
@@ -77,6 +177,7 @@ def scanImage(img) {
     if (params.SECURITY_GATE) {
         sh """
             trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
+              --ignorefile ${env.TRIVY_IGNOREFILE} \
               --no-progress --ignore-unfixed --skip-db-update \
               --severity ${params.GATE_SEVERITY} --exit-code 1 ${ref}
         """
@@ -119,30 +220,45 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '15'))
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 90, unit: 'MINUTES')
     }
 
     parameters {
         string(name: 'AWS_REGION', defaultValue: 'eu-west-3',
                description: 'AWS region of the ECR registry')
         string(name: 'IMAGE_TAG', defaultValue: '',
-               description: 'Leave empty to use the short git SHA, or set an immutable tag (e.g. v1.0.3)')
+               description: 'Leave empty for <git-sha>-<build-number>, or set an explicit tag (e.g. v1.0.3). ECR repos are IMMUTABLE, so the tag must be unique per push')
         string(name: 'GATE_SEVERITY', defaultValue: 'HIGH,CRITICAL',
                description: 'Trivy severities that fail the build (fixable only, --ignore-unfixed)')
         string(name: 'TRIVY_CACHE_DIR', defaultValue: '/var/lib/jenkins/.cache/trivy',
                description: 'Persistent Trivy cache dir (must be writable by the jenkins user)')
+        string(name: 'SONAR_HOST_URL', defaultValue: 'http://localhost:9000',
+               description: 'SonarQube base URL — runs as a container on this same instance')
+        string(name: 'SONAR_PROJECT_KEY', defaultValue: 'vprofile',
+               description: 'SonarQube project key (auto-created on first analysis)')
+        string(name: 'MAVEN_HEAP', defaultValue: '-Xmx1g',
+               description: 'Heap cap for the Maven JVM inside the app image build. Keep this bounded — SonarQube shares the 8 GB on this box')
+        booleanParam(name: 'RUN_SONAR', defaultValue: true,
+               description: 'Run Maven verify + SonarQube analysis')
+        booleanParam(name: 'SONAR_GATE', defaultValue: false,
+               description: 'Audit mode when false: the analysis is published but the gate verdict never blocks the build. Set true to fail on a failing quality gate')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false,
+               description: 'Skip unit tests during Maven verify. Leaves SonarQube with no coverage data — only for debugging the pipeline')
         booleanParam(name: 'SECURITY_GATE', defaultValue: false,
                description: 'Audit mode when false: scan + SBOM still run and are archived, but findings never block the push. Set true to fail the build on GATE_SEVERITY findings')
         booleanParam(name: 'PUSH_LATEST', defaultValue: false,
-               description: 'Push a mutable "latest" tag. Keep false for IMMUTABLE prod repos (see terraform)')
+               description: 'Push a mutable "latest" tag. MUST stay false — the ECR repos are IMMUTABLE (see terraform)')
         booleanParam(name: 'PARALLEL', defaultValue: false,
-               description: 'Build/scan images in parallel. Risky on a t3.medium — only enable on a larger agent')
+               description: 'Build/scan images in parallel. Risky while SonarQube shares this box — only enable on a larger agent')
     }
 
     environment {
-        AWS_REGION      = "${params.AWS_REGION}"
-        TRIVY_CACHE_DIR = "${params.TRIVY_CACHE_DIR}"
-        REPO_URL        = 'https://github.com/yousefsalemW/VProfile-Final'
+        AWS_REGION       = "${params.AWS_REGION}"
+        TRIVY_CACHE_DIR  = "${params.TRIVY_CACHE_DIR}"
+        TRIVY_IGNOREFILE = "${WORKSPACE}/Build-Images/.trivyignore"
+        MAVEN_CACHE      = '/var/lib/jenkins/.m2'
+        SONAR_HOST_URL   = "${params.SONAR_HOST_URL}"
+        REPO_URL         = 'https://github.com/yousefsalemW/DEVSECOPS-PLATFORM-EKS'
     }
 
     stages {
@@ -150,10 +266,13 @@ pipeline {
         stage('Init') {
             steps {
                 script {
-                    // Immutable git sha for labels; the push TAG may be a semver override.
+                    // The ECR repos are IMMUTABLE, so the default tag has to be
+                    // unique per build — a bare git sha would make any re-run of
+                    // the same commit fail on ImageTagAlreadyExistsException.
                     env.GIT_SHA    = sh(returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
                     env.BUILD_DATE = sh(returnStdout: true, script: 'date -u +%Y-%m-%dT%H:%M:%SZ').trim()
-                    env.TAG        = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.GIT_SHA
+                    env.TAG        = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim()
+                                                             : "${env.GIT_SHA}-${env.BUILD_NUMBER}"
 
                     // Resolve the account id at runtime → build the ECR registry URL.
                     env.AWS_ACCOUNT_ID = sh(returnStdout: true,
@@ -167,22 +286,54 @@ pipeline {
 
                     echo """
                     ┌────────────────────────────────────────────
-                    │ REGISTRY : ${env.ECR_REGISTRY}
-                    │ TAG      : ${env.TAG}   (git ${env.GIT_SHA})
-                    │ GATE     : ${params.SECURITY_GATE ? params.GATE_SEVERITY : 'disabled'}
-                    │ PARALLEL : ${params.PARALLEL}
-                    │ IMAGES   : ${IMAGES.collect { it.name }.join(', ')}
+                    │ REGISTRY   : ${env.ECR_REGISTRY}
+                    │ TAG        : ${env.TAG}   (git ${env.GIT_SHA})
+                    │ SONAR      : ${params.RUN_SONAR ? env.SONAR_HOST_URL : 'skipped'}
+                    │ SONAR GATE : ${params.SONAR_GATE ? 'enforced' : 'audit only'}
+                    │ TRIVY GATE : ${params.SECURITY_GATE ? params.GATE_SEVERITY : 'audit only'}
+                    │ PARALLEL   : ${params.PARALLEL}
+                    │ IMAGES     : ${IMAGES.collect { it.name }.join(', ')}
                     └────────────────────────────────────────────"""
                 }
             }
         }
 
-        // ---------- 1. Build every image (with --pull, BuildKit, OCI labels) ---
+        // ---------- 1. Compile + test on the host so Sonar has bytecode --------
+        stage('Maven Verify') {
+            when { expression { params.RUN_SONAR } }
+            steps { script { mavenVerify() } }
+            post {
+                always {
+                    junit testResults: 'Build-Images/target/surefire-reports/*.xml',
+                          allowEmptyResults: true
+                }
+            }
+        }
+
+        // ---------- 2. SonarQube analysis + quality gate -----------------------
+        stage('SonarQube') {
+            when { expression { params.RUN_SONAR } }
+            steps {
+                script {
+                    sonarScan()
+                    if (params.SONAR_GATE) {
+                        sonarQualityGate()
+                    } else {
+                        echo 'SONAR_GATE=false → analysis published, verdict not enforced'
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            sonarQualityGate()
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- 3. Build every image (with --pull, BuildKit, OCI labels) ---
         stage('Build') {
             steps { script { forEachImage(IMAGES, params.PARALLEL) { img -> buildImage(img) } } }
         }
 
-        // ---------- 2. Security scan with Trivy + SBOM -------------------------
+        // ---------- 4. Security scan with Trivy + SBOM -------------------------
         stage('Trivy Scan') {
             steps { script { forEachImage(IMAGES, params.PARALLEL) { img -> scanImage(img) } } }
             post {
@@ -192,7 +343,7 @@ pipeline {
             }
         }
 
-        // ---------- 3. Login to ECR --------------------------------------------
+        // ---------- 5. Login to ECR --------------------------------------------
         stage('ECR Login') {
             steps {
                 retry(3) {
@@ -204,17 +355,17 @@ pipeline {
             }
         }
 
-        // ---------- 4. Tag images ----------------------------------------------
+        // ---------- 6. Tag images ----------------------------------------------
         stage('Tag') {
             steps { script { IMAGES.each { img -> tagImage(img) } } }
         }
 
-        // ---------- 5. Push to ECR (with retry) --------------------------------
+        // ---------- 7. Push to ECR (with retry) --------------------------------
         stage('Push') {
             steps { script { forEachImage(IMAGES, params.PARALLEL) { img -> pushImage(img) } } }
         }
 
-        // ---------- 6. Verify images exist in ECR ------------------------------
+        // ---------- 8. Verify images exist in ECR ------------------------------
         stage('Verify') {
             steps { script { IMAGES.each { img -> verifyImage(img) } } }
         }

@@ -1,0 +1,14 @@
+vprofile {{ .Chart.AppVersion }} deployed to namespace {{ .Release.Namespace }}
+image tag: {{ .Values.image.tag }}
+
+Watch it come up (db01 first, then app01 clears its initContainer):
+  kubectl -n {{ .Release.Namespace }} get pods -w
+
+{{ if .Values.ingress.enabled }}
+Get the ALB address (blank for the first 2-3 minutes while it provisions):
+  kubectl -n {{ .Release.Namespace }} get ingress vprofile \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+{{- else }}
+Ingress is disabled — reach the app with a port-forward instead:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/vproweb 8081:80
+{{- end }}

@@ -1,0 +1,31 @@
+{{- if .Values.ingress.enabled }}
+# Provisions an internet-facing ALB via the AWS Load Balancer Controller.
+# NOTE: this object is what costs money (~$0.65/day) — delete the release or set
+# ingress.enabled=false when you are not demoing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vprofile
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme }}
+    # ip mode targets pod IPs directly instead of node ports — one less hop, and
+    # it works because vpc-cni gives every pod a real VPC address.
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheckPath | quote }}
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/tags: Project=vprofile,ManagedBy=Helm
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vproweb
+                port:
+                  number: 80
+{{- end }}

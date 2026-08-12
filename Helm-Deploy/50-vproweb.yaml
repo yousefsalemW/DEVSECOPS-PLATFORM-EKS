@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vproweb
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  # NodePort, not LoadBalancer: the ALB is provisioned by the Ingress below, so
+  # a Service of type LoadBalancer here would create a SECOND, redundant NLB.
+  type: NodePort
+  selector:
+    app: vproweb
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vproweb
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      app: vproweb
+  template:
+    metadata:
+      labels:
+        app: vproweb
+        {{- include "vprofile.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: nginx
+          image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-web") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 80
+          # nginx resolves app01 once at startup. If it boots before the Service
+          # exists it exits with "host not found in upstream", so let Kubernetes
+          # restart it rather than blocking on an initContainer.
+          readinessProbe:
+            httpGet: { path: /login, port: 80 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+          resources: {{- toYaml .Values.web.resources | nindent 12 }}

@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: app01              # nginx.conf proxies to app01:8080 — do not rename
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: app01
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app01
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.app.replicas }}
+  selector:
+    matchLabels:
+      app: app01
+  template:
+    metadata:
+      labels:
+        app: app01
+        {{- include "vprofile.labels" . | nindent 8 }}
+    spec:
+      # Spring builds its Hibernate SessionFactory during context startup. If
+      # MySQL is not accepting connections yet, the context fails and Tomcat
+      # serves 404 for the life of the pod — a restart is the only cure. Waiting
+      # here is cheaper than a CrashLoop that never actually crashes.
+      initContainers:
+        - name: wait-for-backends
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              for svc in db01:3306 mc01:11211 rmq01:5672; do
+                host=${svc%%:*}; port=${svc##*:}
+                echo "waiting for ${host}:${port}"
+                until nc -z "${host}" "${port}"; do sleep 3; done
+                echo "  ${host}:${port} up"
+              done
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { memory: 32Mi }
+      containers:
+        - name: tomcat
+          image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-app") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          # /login is the first page that returns 200. / returns a 302 redirect,
+          # which a probe with default success codes treats as a failure.
+          readinessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 120
+            periodSeconds: 20
+          resources: {{- toYaml .Values.app.resources | nindent 12 }}

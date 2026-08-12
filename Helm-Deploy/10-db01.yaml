@@ -1,0 +1,86 @@
+# MySQL — StatefulSet because the data must survive a pod restart, and the
+# initdb script only seeds an EMPTY datadir (a fresh PVC re-seeds, an existing
+# one is left alone).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db01-credentials
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  # Placeholder for Vault. Until the app image renders application.properties at
+  # startup, this value has to equal the one compiled into the WAR.
+  MYSQL_ROOT_PASSWORD: {{ .Values.db.rootPassword | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db01
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  clusterIP: None          # headless: stable DNS for the StatefulSet pod
+  selector:
+    app: db01
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db01
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  serviceName: db01
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db01
+  template:
+    metadata:
+      labels:
+        app: db01
+        {{- include "vprofile.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: mysql
+          image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-db") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: db01-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          # mysqladmin ping, authenticated — an unauthenticated ping reports OK
+          # while the server is still running the initdb scripts.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - mysqladmin ping -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - mysqladmin ping -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
+            initialDelaySeconds: 120
+            periodSeconds: 20
+          resources: {{- toYaml .Values.database.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storage.className }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

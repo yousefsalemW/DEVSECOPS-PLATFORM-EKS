@@ -1,0 +1,61 @@
+# =============================================================================
+#  VProfile Helm values
+#
+#  IMPORTANT — the Service names in this chart are NOT free choices.
+#  application.properties is baked into the app image at build time and points at
+#  db01 / mc01 / rmq01 by hostname, and docker/web/nginx.conf proxies to app01.
+#  Renaming a Service breaks the app with no error at deploy time.
+# =============================================================================
+
+# ECR registry, e.g. 450444046673.dkr.ecr.eu-west-3.amazonaws.com
+# Passed by the pipeline: --set image.registry=... --set image.tag=...
+image:
+  registry: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Credentials the app image was built with. jdbc.password is compiled into the
+# WAR's application.properties, so this value MUST match it until Vault lands
+# and the properties are rendered at startup instead of at build time.
+db:
+  rootPassword: vprodbpass
+  name: accounts
+
+storage:
+  className: gp3
+  size: 8Gi
+
+ingress:
+  enabled: true
+  className: alb
+  scheme: internet-facing
+  # Tomcat sends 302 from / to /login, which an ALB health check reads as
+  # unhealthy — so probe the page that actually returns 200.
+  healthcheckPath: /login
+
+app:
+  replicas: 2
+  resources:
+    requests: { cpu: 200m, memory: 768Mi }
+    limits:   { memory: 1536Mi }
+
+web:
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { memory: 128Mi }
+
+database:
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { memory: 1Gi }
+
+memcached:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { memory: 192Mi }
+
+rabbitmq:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }

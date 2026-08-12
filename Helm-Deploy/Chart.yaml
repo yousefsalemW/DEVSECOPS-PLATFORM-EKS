@@ -1,0 +1,8 @@
+apiVersion: v2
+name: vprofile
+description: VProfile multi-tier Java application — nginx → Tomcat → MySQL/Memcached/RabbitMQ
+type: application
+version: 1.0.0
+appVersion: "2.0"
+maintainers:
+  - name: ALnaqib

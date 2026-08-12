@@ -61,13 +61,24 @@ def mavenVerify() {
 // The scanner CLI needs Java 17+, while the app is built on Java 11 — so it runs
 // as its own container rather than as a maven goal in the build above.
 // --network host: SonarQube is bound to 127.0.0.1:9000 on this same instance.
+//
+// SONAR_USER_HOME: the image ships its cache at /opt/sonar-scanner/.sonar, owned
+// by the image's own uid 1000. Running with -u <jenkins uid> makes that path
+// unwritable and the scanner dies on startup with
+//   AccessDeniedException: /opt/sonar-scanner/.sonar/cache
+// So point SONAR_USER_HOME at a directory we own and bind-mount it from the
+// host — which also persists the downloaded scanner engine between builds
+// instead of re-fetching it every run.
 def sonarScan() {
     withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
         sh """
+            mkdir -p ${env.SONAR_CACHE}
             docker run --rm \
               -u \$(id -u):\$(id -g) \
               --network host \
               -v "${env.WORKSPACE}/Build-Images":/usr/src \
+              -v ${env.SONAR_CACHE}:/sonar-cache \
+              -e SONAR_USER_HOME=/sonar-cache \
               -e SONAR_HOST_URL=${env.SONAR_HOST_URL} \
               -e SONAR_TOKEN=\${SONAR_TOKEN} \
               sonarsource/sonar-scanner-cli:latest \
@@ -129,7 +140,11 @@ def sonarQualityGate() {
 def buildImage(img) {
     echo "==> build ${img.name}:${env.TAG}"
     // --pull        : always fetch the latest base image (covers base-image CVEs)
-    // BuildKit      : faster builds + better layer cache
+    // BuildKit      : faster builds + better layer cache. NOTE: this only takes
+    //                 effect if the buildx plugin is installed; the Ubuntu
+    //                 docker.io package ships without it and silently falls back
+    //                 to the legacy builder (see the deprecation warning in the
+    //                 console log). Install docker-buildx to get real BuildKit.
     // OCI labels    : git sha / build date / version for audit & traceability
     // MAVEN_HEAP    : caps the Maven JVM inside the app build. NOTE: docker's
     //                 --memory flag is silently IGNORED under BuildKit, so the
@@ -232,6 +247,8 @@ pipeline {
                description: 'Trivy severities that fail the build (fixable only, --ignore-unfixed)')
         string(name: 'TRIVY_CACHE_DIR', defaultValue: '/var/lib/jenkins/.cache/trivy',
                description: 'Persistent Trivy cache dir (must be writable by the jenkins user)')
+        string(name: 'SONAR_CACHE_DIR', defaultValue: '/var/lib/jenkins/.sonar',
+               description: 'Persistent SonarQube scanner cache dir, mounted as SONAR_USER_HOME (must be writable by the jenkins user)')
         string(name: 'SONAR_HOST_URL', defaultValue: 'http://localhost:9000',
                description: 'SonarQube base URL — runs as a container on this same instance')
         string(name: 'SONAR_PROJECT_KEY', defaultValue: 'vprofile',
@@ -257,6 +274,7 @@ pipeline {
         TRIVY_CACHE_DIR  = "${params.TRIVY_CACHE_DIR}"
         TRIVY_IGNOREFILE = "${WORKSPACE}/Build-Images/.trivyignore"
         MAVEN_CACHE      = '/var/lib/jenkins/.m2'
+        SONAR_CACHE      = "${params.SONAR_CACHE_DIR}"
         SONAR_HOST_URL   = "${params.SONAR_HOST_URL}"
         REPO_URL         = 'https://github.com/yousefsalemW/DEVSECOPS-PLATFORM-EKS'
     }

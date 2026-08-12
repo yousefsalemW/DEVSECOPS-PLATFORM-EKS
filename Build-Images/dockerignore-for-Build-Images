@@ -1,0 +1,21 @@
+# =====================================================================
+#  Build-Images/.dockerignore
+#  الـ Maven Verify stage بيولّد target/ و .scannerwork/ جوه نفس المسار،
+#  وهما بيتبعتوا كلهم كـ build context لكل image لو مستثنيناهمش.
+#  الـ Dockerfile محتاج pom.xml + src/ بس.
+# =====================================================================
+
+target/
+.scannerwork/
+.git/
+.gitignore
+
+*.war
+*.jar
+*.log
+
+# محليات المحرر
+*.sw?
+*.deb
+.idea/
+.vscode/

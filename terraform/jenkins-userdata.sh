@@ -238,6 +238,8 @@ systemctl daemon-reload
 systemctl enable jenkins
 systemctl restart jenkins
 
+
+apt-get install -y docker-buildx
 ###############################################################################
 log "verifying the install"
 ###############################################################################

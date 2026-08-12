@@ -5,6 +5,11 @@ COPY src ./src
 ARG DB_HOST=db01
 ARG MC_HOST=mc01
 ARG RMQ_HOST=rmq01
+# Cap the Maven JVM. docker's --memory flag is silently IGNORED under BuildKit,
+# so the only place the build's memory can actually be bounded is the JVM itself.
+# This box also runs SonarQube (~2.5 GB of heap) and Jenkins (1.5 GB) on 8 GB.
+ARG MAVEN_HEAP=-Xmx1g
+ENV MAVEN_OPTS=${MAVEN_HEAP}
 RUN set -eux; p=src/main/resources/application.properties; \
     sed -i "s#jdbc:mysql://db01:#jdbc:mysql://${DB_HOST}:#"                   "$p"; \
     sed -i "s#memcached.active.host=mc01#memcached.active.host=${MC_HOST}#"   "$p"; \

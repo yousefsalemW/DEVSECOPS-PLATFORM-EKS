@@ -18,8 +18,21 @@ image:
 # WAR's application.properties, so this value MUST match it until Vault lands
 # and the properties are rendered at startup instead of at build time.
 db:
-  rootPassword: vprodbpass
   name: accounts
+
+  # No password lives in this file. Pick ONE of the two below.
+  #
+  # Preferred — a Secret created outside the chart (by you now, by Vault later).
+  # It must contain the key MYSQL_ROOT_PASSWORD, because the db container reads
+  # it with envFrom and the MySQL entrypoint expects that exact name:
+  #   kubectl -n vprofile create secret generic db01-credentials \
+  #     --from-literal=MYSQL_ROOT_PASSWORD='<strong password>'
+  existingSecret: ""
+
+  # Escape hatch — pass at install time, never commit a value here:
+  #   helm upgrade --install ... --set db.rootPassword="$DB_PASSWORD"
+  # The chart then creates the Secret itself.
+  rootPassword: ""
 
 storage:
   className: gp3

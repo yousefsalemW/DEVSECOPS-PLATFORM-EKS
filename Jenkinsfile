@@ -89,7 +89,7 @@ def sonarScan() {
               -v ${env.SONAR_CACHE}:/sonar-cache \
               -e SONAR_USER_HOME=/sonar-cache \
               -e SONAR_HOST_URL=${env.SONAR_HOST_URL} \
-              -e SONAR_TOKEN=\${SONAR_TOKEN} \
+              -e SONAR_TOKEN\
               sonarsource/sonar-scanner-cli:latest \
                 -Dsonar.working.directory=/usr/src/.scannerwork \
                 -Dsonar.projectKey=${params.SONAR_PROJECT_KEY} \

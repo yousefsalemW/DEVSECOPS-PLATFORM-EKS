@@ -1,6 +1,10 @@
+{{- include "vprofile.requireDbSecret" . }}
 # MySQL — StatefulSet because the data must survive a pod restart, and the
 # initdb script only seeds an EMPTY datadir (a fresh PVC re-seeds, an existing
 # one is left alone).
+{{- if not .Values.db.existingSecret }}
+# Only rendered when the password came in via --set. With db.existingSecret the
+# chart touches no credential at all, which is the path Vault will take over.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -8,10 +12,9 @@ metadata:
   labels: {{- include "vprofile.labels" . | nindent 4 }}
 type: Opaque
 stringData:
-  # Placeholder for Vault. Until the app image renders application.properties at
-  # startup, this value has to equal the one compiled into the WAR.
   MYSQL_ROOT_PASSWORD: {{ .Values.db.rootPassword | quote }}
 ---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -51,7 +54,7 @@ spec:
             - containerPort: 3306
           envFrom:
             - secretRef:
-                name: db01-credentials
+                name: {{ include "vprofile.dbSecretName" . }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/mysql

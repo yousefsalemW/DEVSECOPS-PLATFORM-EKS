@@ -53,6 +53,19 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: 8080
+          env:
+            # Overrides the password compiled into the WAR — no image rebuild.
+            # Spring 5's <context:property-placeholder> builds a
+            # PropertySourcesPlaceholderConfigurer whose localOverride defaults to
+            # false, so the Environment is consulted BEFORE application.properties,
+            # and SystemEnvironmentPropertySource maps JDBC_PASSWORD -> jdbc.password.
+            # Verify once after the first deploy:
+            #   kubectl -n vprofile exec deploy/app01 -- printenv JDBC_PASSWORD
+            - name: JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vprofile.dbSecretName" . }}
+                  key: MYSQL_ROOT_PASSWORD
           # /login is the first page that returns 200. / returns a 302 redirect,
           # which a probe with default success codes treats as a failure.
           readinessProbe:

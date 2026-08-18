@@ -44,7 +44,7 @@ public class User implements Serializable {
     private Set<Role> roles;
     /** {@inheritDoc}} !*/
     @Id
-    @GeneratedValue(strategy = GenerationType.AUTO)
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     /** {@link User#id} */
     public Long getId() {
         return id;

@@ -14,7 +14,7 @@ public class Role {
     private Set<User> users;
     /** {@inheritDoc}} !*/
     @Id
-    @GeneratedValue(strategy = GenerationType.AUTO)
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     /**
      * {@link Role#id}
      !*/

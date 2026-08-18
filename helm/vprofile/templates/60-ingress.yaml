@@ -8,7 +8,6 @@ metadata:
   name: vprofile
   labels: {{- include "vprofile.labels" . | nindent 4 }}
   annotations:
-    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=86400
     alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme }}
     # ip mode targets pod IPs directly instead of node ports — one less hop, and
     # it works because vpc-cni gives every pod a real VPC address.

@@ -6,6 +6,10 @@ metadata:
 spec:
   selector:
     app: app01
+    sessionAffinity: ClientIP
+    sessionAffinityConfig:
+      clientIP:
+        timeoutSeconds: 10800
   ports:
     - name: http
       port: 8080

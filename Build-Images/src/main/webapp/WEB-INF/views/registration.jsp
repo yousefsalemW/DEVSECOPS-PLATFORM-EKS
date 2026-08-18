@@ -69,6 +69,7 @@
 <div class="container">
 
     <form:form method="POST" modelAttribute="userForm" class="form-signin">
+    <input type="hidden" name="${_csrf.parameterName}" value="${_csrf.token}"/>
         <h2 class="form-signin-heading" align="center">SIGN UP</h2>
         <img  class="logo" src="${contextPath}/resources/Images/visualpathlogo3.png" />
         <spring:bind path="username">

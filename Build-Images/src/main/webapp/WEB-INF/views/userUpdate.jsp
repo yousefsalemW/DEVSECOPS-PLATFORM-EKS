@@ -36,6 +36,7 @@
 	<div class="row">
 	<div class="col-md-12 ">
     <form:form method="POST" modelAttribute="user" class="form-horizontal">
+    <input type="hidden" name="${_csrf.parameterName}" value="${_csrf.token}"/>
         <fieldset>      
       
 		 <div class="form-group">

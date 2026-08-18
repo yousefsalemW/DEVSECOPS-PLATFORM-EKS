@@ -47,7 +47,7 @@ ingress:
   healthcheckPath: /login
 
 app:
-  replicas: 1
+  replicas: 2
   resources:
     requests: { cpu: 200m, memory: 768Mi }
     limits:   { memory: 1536Mi }

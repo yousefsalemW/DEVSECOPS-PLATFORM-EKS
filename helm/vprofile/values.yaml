@@ -96,6 +96,14 @@ podDisruptionBudgets:
     enabled: true
     minAvailable: 1      # 1 replica  -> blocks voluntary eviction entirely
 
+# NetworkPolicies. REQUIRES vpc-cni enableNetworkPolicy=true in terraform -
+# without it these render, apply, and enforce nothing.
+networkPolicies:
+  enabled: true
+  # The ALB reaches pods from its own ENIs, which are not pods, so ingress to
+  # vproweb has to be expressed as an ipBlock. Must match terraform/vpc.tf.
+  vpcCidr: 10.0.0.0/16
+
 ingress:
   enabled: true
   className: alb

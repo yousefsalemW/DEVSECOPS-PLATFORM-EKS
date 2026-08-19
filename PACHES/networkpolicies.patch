@@ -1,0 +1,270 @@
+diff --git a/helm/vprofile/templates/80-networkpolicy.yaml b/helm/vprofile/templates/80-networkpolicy.yaml
+new file mode 100644
+index 0000000..db7cc04
+--- /dev/null
++++ b/helm/vprofile/templates/80-networkpolicy.yaml
+@@ -0,0 +1,149 @@
++{{- if .Values.networkPolicies.enabled }}
++# =============================================================================
++#  NetworkPolicies - workload isolation inside the vprofile namespace
++#
++#  PREREQUISITE: the vpc-cni addon must have enableNetworkPolicy=true (set in
++#  terraform/eks.tf). Without it every rule below is accepted and silently
++#  ignored. Verify enforcement, do not assume it - see NOTES at the bottom.
++#
++#  Design: default-deny BOTH directions, then open exactly the paths the
++#  application actually uses. Ingress-only rules would still let a compromised
++#  pod dial out and exfiltrate.
++#
++#  Traffic map this encodes:
++#     ALB ──▶ vproweb:80 ──▶ app01:8080 ──▶ db01:3306
++#                                       ├─▶ mc01:11211
++#                                       └─▶ rmq01:5672
++# =============================================================================
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: default-deny
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  # Empty podSelector = every pod in the namespace.
++  podSelector: {}
++  policyTypes: [Ingress, Egress]
++  # No rules at all: nothing in, nothing out. Everything below adds back.
++---
++# DNS must be allowed explicitly or every pod loses name resolution the moment
++# default-deny lands. This is the single most common way a first NetworkPolicy
++# rollout takes an application down.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: allow-dns
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  podSelector: {}
++  policyTypes: [Egress]
++  egress:
++    - to:
++        - namespaceSelector:
++            matchLabels:
++              kubernetes.io/metadata.name: kube-system
++      ports:
++        - { protocol: UDP, port: 53 }
++        - { protocol: TCP, port: 53 }
++---
++# vproweb accepts :80 from the ALB. With target-type=ip the ALB reaches pod IPs
++# from its own ENIs, which are NOT pods - so this has to be an ipBlock of the
++# VPC, not a podSelector. That is a real limitation, not a shortcut.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: vproweb-ingress
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  podSelector:
++    matchLabels:
++      app: vproweb
++  policyTypes: [Ingress]
++  ingress:
++    - from:
++        - ipBlock:
++            cidr: {{ .Values.networkPolicies.vpcCidr }}
++      ports:
++        - { protocol: TCP, port: 80 }
++---
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: vproweb-egress
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  podSelector:
++    matchLabels:
++      app: vproweb
++  policyTypes: [Egress]
++  egress:
++    - to:
++        - podSelector:
++            matchLabels:
++              app: app01
++      ports:
++        - { protocol: TCP, port: 8080 }
++---
++# The highest-value rule in this file: app01 is the ONLY thing that may open a
++# connection to the database. A compromised nginx cannot reach MySQL at all.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: app01
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  podSelector:
++    matchLabels:
++      app: app01
++  policyTypes: [Ingress, Egress]
++  ingress:
++    - from:
++        - podSelector:
++            matchLabels:
++              app: vproweb
++      ports:
++        - { protocol: TCP, port: 8080 }
++  egress:
++    - to:
++        - podSelector:
++            matchLabels:
++              app: db01
++      ports:
++        - { protocol: TCP, port: 3306 }
++    - to:
++        - podSelector:
++            matchLabels:
++              app: mc01
++      ports:
++        - { protocol: TCP, port: 11211 }
++    - to:
++        - podSelector:
++            matchLabels:
++              app: rmq01
++      ports:
++        - { protocol: TCP, port: 5672 }
++---
++# The three backends accept only from app01, and are given NO egress rule at
++# all beyond DNS - a compromised database cannot call out to the internet.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: backends-ingress
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++spec:
++  podSelector:
++    matchExpressions:
++      - key: app
++        operator: In
++        values: [db01, mc01, rmq01]
++  policyTypes: [Ingress]
++  ingress:
++    - from:
++        - podSelector:
++            matchLabels:
++              app: app01
++      ports:
++        - { protocol: TCP, port: 3306 }
++        - { protocol: TCP, port: 11211 }
++        - { protocol: TCP, port: 5672 }
++{{- end }}
+diff --git a/helm/vprofile/values.yaml b/helm/vprofile/values.yaml
+index 85e09c2..f2df088 100644
+--- a/helm/vprofile/values.yaml
++++ b/helm/vprofile/values.yaml
+@@ -96,6 +96,14 @@ podDisruptionBudgets:
+     enabled: true
+     minAvailable: 1      # 1 replica  -> blocks voluntary eviction entirely
+ 
++# NetworkPolicies. REQUIRES vpc-cni enableNetworkPolicy=true in terraform -
++# without it these render, apply, and enforce nothing.
++networkPolicies:
++  enabled: true
++  # The ALB reaches pods from its own ENIs, which are not pods, so ingress to
++  # vproweb has to be expressed as an ipBlock. Must match terraform/vpc.tf.
++  vpcCidr: 10.0.0.0/16
++
+ ingress:
+   enabled: true
+   className: alb
+diff --git a/terraform/eks.tf b/terraform/eks.tf
+index ea5697d..69671a8 100644
+--- a/terraform/eks.tf
++++ b/terraform/eks.tf
+@@ -8,13 +8,13 @@ module "eks" {
+   vpc_id     = module.vpc.vpc_id
+   subnet_ids = module.vpc.private_subnets
+ 
+-  enable_irsa                              = true
+-  
++  enable_irsa = true
++
+   #JOIN API SERVER
+-  cluster_endpoint_public_access = false
+-  cluster_endpoint_private_access = true
++  cluster_endpoint_public_access           = false
++  cluster_endpoint_private_access          = true
+   enable_cluster_creator_admin_permissions = true
+-  
++
+   eks_managed_node_groups = {
+     workers = {
+       instance_types = ["m7i-flex.large"]
+@@ -23,32 +23,40 @@ module "eks" {
+       desired_size   = 3
+     }
+   }
+-  
++
+   #Logs
+-cluster_enabled_log_types = [
+-  "api",
+-  "audit",
+-  "authenticator",
+-  "controllerManager",
+-  "scheduler"
+-]
++  cluster_enabled_log_types = [
++    "api",
++    "audit",
++    "authenticator",
++    "controllerManager",
++    "scheduler"
++  ]
+ 
+ 
+ 
+ 
+-# Encryption Cluster data 
+-create_kms_key = true
++  # Encryption Cluster data 
++  create_kms_key = true
+ 
+-cluster_encryption_config = {
+-  resources = ["secrets"]
+-}
++  cluster_encryption_config = {
++    resources = ["secrets"]
++  }
+ 
+ 
+   # addons اللي مش محتاجة IRSA مخصص (الـ EBS CSI بره الـ module عشان نكسر الـ cycle)
+-cluster_addons = {
+-  coredns = {}
+-  kube-proxy = {}
+-  vpc-cni = {}
++  cluster_addons = {
++    coredns    = {}
++    kube-proxy = {}
++    # NetworkPolicy enforcement is OFF by default in vpc-cni. Without this the API
++    # server happily ACCEPTS every NetworkPolicy, kubectl displays them, and
++    # nothing is ever enforced - which is worse than having none, because it looks
++    # like segmentation exists.
++    vpc-cni = {
++      configuration_values = jsonencode({
++        enableNetworkPolicy = "true"
++      })
++    }
+   }
+ }
+ 
+@@ -84,10 +92,10 @@ module "ebs_csi_role" {
+   }
+ }
+ resource "aws_security_group_rule" "jenkins_to_eks" {
+-  type                     = "ingress"
+-  from_port                = 443
+-  to_port                  = 443
+-  protocol                 = "tcp"
++  type      = "ingress"
++  from_port = 443
++  to_port   = 443
++  protocol  = "tcp"
+ 
+   security_group_id        = module.eks.cluster_primary_security_group_id
+   source_security_group_id = aws_security_group.jenkins.id

@@ -8,13 +8,13 @@ module "eks" {
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 
-  enable_irsa                              = true
-  
+  enable_irsa = true
+
   #JOIN API SERVER
-  cluster_endpoint_public_access = false
-  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access           = false
+  cluster_endpoint_private_access          = true
   enable_cluster_creator_admin_permissions = true
-  
+
   eks_managed_node_groups = {
     workers = {
       instance_types = ["m7i-flex.large"]
@@ -23,32 +23,40 @@ module "eks" {
       desired_size   = 3
     }
   }
-  
+
   #Logs
-cluster_enabled_log_types = [
-  "api",
-  "audit",
-  "authenticator",
-  "controllerManager",
-  "scheduler"
-]
+  cluster_enabled_log_types = [
+    "api",
+    "audit",
+    "authenticator",
+    "controllerManager",
+    "scheduler"
+  ]
 
 
 
 
-# Encryption Cluster data 
-create_kms_key = true
+  # Encryption Cluster data 
+  create_kms_key = true
 
-cluster_encryption_config = {
-  resources = ["secrets"]
-}
+  cluster_encryption_config = {
+    resources = ["secrets"]
+  }
 
 
   # addons اللي مش محتاجة IRSA مخصص (الـ EBS CSI بره الـ module عشان نكسر الـ cycle)
-cluster_addons = {
-  coredns = {}
-  kube-proxy = {}
-  vpc-cni = {}
+  cluster_addons = {
+    coredns    = {}
+    kube-proxy = {}
+    # NetworkPolicy enforcement is OFF by default in vpc-cni. Without this the API
+    # server happily ACCEPTS every NetworkPolicy, kubectl displays them, and
+    # nothing is ever enforced - which is worse than having none, because it looks
+    # like segmentation exists.
+    vpc-cni = {
+      configuration_values = jsonencode({
+        enableNetworkPolicy = "true"
+      })
+    }
   }
 }
 
@@ -84,10 +92,10 @@ module "ebs_csi_role" {
   }
 }
 resource "aws_security_group_rule" "jenkins_to_eks" {
-  type                     = "ingress"
-  from_port                = 443
-  to_port                  = 443
-  protocol                 = "tcp"
+  type      = "ingress"
+  from_port = 443
+  to_port   = 443
+  protocol  = "tcp"
 
   security_group_id        = module.eks.cluster_primary_security_group_id
   source_security_group_id = aws_security_group.jenkins.id

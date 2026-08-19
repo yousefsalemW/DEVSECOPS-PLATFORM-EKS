@@ -255,14 +255,23 @@ def preflight() {
         kubectl get nodes --no-headers | awk '{print "  node " \$1 " " \$2}'
     """
 
-    def missing = sh(returnStatus: true, script: """
-        kubectl -n ${params.K8S_NAMESPACE} get secret ${params.DB_SECRET_NAME} > /dev/null 2>&1
-    """)
-    if (missing != 0) {
-        error("""Secret '${params.DB_SECRET_NAME}' not found in namespace '${params.K8S_NAMESPACE}'.
-The chart requires it (db.existingSecret) and will not render without it. Create it once:
-  kubectl -n ${params.K8S_NAMESPACE} create secret generic ${params.DB_SECRET_NAME} \\
-    --from-literal=MYSQL_ROOT_PASSWORD='<strong password>'""")
+    // Both credentials are required by the chart (db.existingSecret and
+    // rabbitmq.existingSecret). Checked here rather than left to helm, because
+    // a missing Secret otherwise surfaces a minute into the render as a template
+    // failure with no hint about which one, or how to create it.
+    [
+        [name: params.DB_SECRET_NAME,  value: 'db.existingSecret',       keys: "--from-literal=MYSQL_ROOT_PASSWORD='<strong password>'"],
+        [name: params.RMQ_SECRET_NAME, value: 'rabbitmq.existingSecret', keys: "--from-literal=RABBITMQ_DEFAULT_USER='vprofile' \\\n    --from-literal=RABBITMQ_DEFAULT_PASS='<strong password>'"],
+    ].each { sec ->
+        def missing = sh(returnStatus: true, script: """
+            kubectl -n ${params.K8S_NAMESPACE} get secret ${sec.name} > /dev/null 2>&1
+        """)
+        if (missing != 0) {
+            error("""Secret '${sec.name}' not found in namespace '${params.K8S_NAMESPACE}'.
+The chart requires it (${sec.value}) and will not render without it. Create it once:
+  kubectl -n ${params.K8S_NAMESPACE} create secret generic ${sec.name} \\
+    ${sec.keys}""")
+        }
     }
 }
 
@@ -275,6 +284,7 @@ def renderManifests() {
           --set image.registry=${env.ECR_REGISTRY} \
           --set image.tag=${env.TAG} \
           --set db.existingSecret=${params.DB_SECRET_NAME} \
+          --set rabbitmq.existingSecret=${params.RMQ_SECRET_NAME} \
           > rendered-${env.TAG}.yaml
         echo "rendered \$(grep -c '^kind:' rendered-${env.TAG}.yaml) objects"
     """
@@ -291,6 +301,7 @@ def deployRelease() {
           --set image.registry=${env.ECR_REGISTRY} \
           --set image.tag=${env.TAG} \
           --set db.existingSecret=${params.DB_SECRET_NAME} \
+          --set rabbitmq.existingSecret=${params.RMQ_SECRET_NAME} \
           --atomic \
           --timeout ${params.HELM_TIMEOUT}
     """
@@ -385,6 +396,8 @@ pipeline {
                description: 'Helm release name. Changing this creates a SECOND parallel deployment, it does not rename the existing one')
         string(name: 'DB_SECRET_NAME', defaultValue: 'db01-credentials',
                description: 'Pre-existing Secret holding MYSQL_ROOT_PASSWORD. Created out of band so no credential ever enters the pipeline, the chart or Git')
+        string(name: 'RMQ_SECRET_NAME', defaultValue: 'rmq01-credentials',
+               description: 'Pre-existing Secret holding RABBITMQ_DEFAULT_USER and RABBITMQ_DEFAULT_PASS. Same contract as the database one - created out of band, never in the pipeline or Git')
         string(name: 'HELM_TIMEOUT', defaultValue: '10m',
                description: 'How long Helm waits for every workload to become Ready before rolling back')
         booleanParam(name: 'PARALLEL', defaultValue: false,

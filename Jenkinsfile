@@ -236,6 +236,106 @@ def verifyImage(img) {
     }
 }
 
+
+// -------- deployment ---------------------------------------------------------
+
+// Refuse to deploy unless the cluster is reachable AND the credential Secret the
+// chart expects already exists. Both failures are cheap to detect here and
+// expensive to diagnose later: a missing Secret renders fine and only shows up
+// as CreateContainerConfigError minutes into the rollout.
+def preflight() {
+    sh """
+        mkdir -p \$(dirname "\${KUBECONFIG}")
+        aws eks update-kubeconfig \
+          --name ${params.CLUSTER_NAME} \
+          --region ${env.AWS_REGION} \
+          --kubeconfig "\${KUBECONFIG}"
+
+        kubectl version --request-timeout=20s -o json > /dev/null
+        kubectl get nodes --no-headers | awk '{print "  node " \$1 " " \$2}'
+    """
+
+    def missing = sh(returnStatus: true, script: """
+        kubectl -n ${params.K8S_NAMESPACE} get secret ${params.DB_SECRET_NAME} > /dev/null 2>&1
+    """)
+    if (missing != 0) {
+        error("""Secret '${params.DB_SECRET_NAME}' not found in namespace '${params.K8S_NAMESPACE}'.
+The chart requires it (db.existingSecret) and will not render without it. Create it once:
+  kubectl -n ${params.K8S_NAMESPACE} create secret generic ${params.DB_SECRET_NAME} \\
+    --from-literal=MYSQL_ROOT_PASSWORD='<strong password>'""")
+    }
+}
+
+// Render the chart and print it before applying anything. This is the artifact
+// that answers "what exactly did build #47 deploy?" six months from now.
+def renderManifests() {
+    sh """
+        helm template ${params.HELM_RELEASE} helm/vprofile \
+          --namespace ${params.K8S_NAMESPACE} \
+          --set image.registry=${env.ECR_REGISTRY} \
+          --set image.tag=${env.TAG} \
+          --set db.existingSecret=${params.DB_SECRET_NAME} \
+          > rendered-${env.TAG}.yaml
+        echo "rendered \$(grep -c '^kind:' rendered-${env.TAG}.yaml) objects"
+    """
+}
+
+// --atomic is safe HERE but was deliberately avoided during the first manual
+// deploy: on failure it rolls back and deletes the very pods you need to
+// inspect. Now that the deployment is known-good, automatic rollback is what we
+// want -- a failed pipeline must never leave a half-updated release running.
+def deployRelease() {
+    sh """
+        helm upgrade --install ${params.HELM_RELEASE} helm/vprofile \
+          --namespace ${params.K8S_NAMESPACE} --create-namespace \
+          --set image.registry=${env.ECR_REGISTRY} \
+          --set image.tag=${env.TAG} \
+          --set db.existingSecret=${params.DB_SECRET_NAME} \
+          --atomic \
+          --timeout ${params.HELM_TIMEOUT}
+    """
+}
+
+// Prove the rollout actually converged, then prove the app answers.
+// helm --atomic already waits, so this is belt-and-braces plus a real HTTP check.
+def verifyRollout() {
+    sh """
+        kubectl -n ${params.K8S_NAMESPACE} rollout status deploy/app01   --timeout=5m
+        kubectl -n ${params.K8S_NAMESPACE} rollout status deploy/vproweb --timeout=5m
+        kubectl -n ${params.K8S_NAMESPACE} rollout status statefulset/db01 --timeout=5m
+
+        echo "--- deployed images ---"
+        kubectl -n ${params.K8S_NAMESPACE} get deploy,statefulset \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\\t"}{.spec.template.spec.containers[0].image}{"\\n"}{end}'
+    """
+}
+
+// End-to-end smoke test through the ALB. /login is used rather than / because
+// Tomcat answers / with a 302 that a naive check reads as failure.
+// Retried: freshly rolled pods take a moment to register as healthy targets.
+def smokeTest() {
+    def host = sh(returnStdout: true, script: """
+        kubectl -n ${params.K8S_NAMESPACE} get ingress vprofile \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+    """).trim()
+
+    if (!host) {
+        echo 'WARNING: no ALB hostname on the Ingress yet - skipping the smoke test'
+        return
+    }
+
+    echo "smoke testing http://${host}/login"
+    retry(6) {
+        sh """
+            sleep 10
+            code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 http://${host}/login)
+            echo "  GET /login -> \${code}"
+            [ "\${code}" = "200" ]
+        """
+    }
+    echo "APPLICATION IS LIVE: http://${host}/"
+}
+
 // -------- pipeline ----------------------------------------------------------
 
 pipeline {
@@ -275,6 +375,18 @@ pipeline {
                description: 'Audit mode when false: scan + SBOM still run and are archived, but findings never block the push. Set true to fail the build on GATE_SEVERITY findings')
         booleanParam(name: 'PUSH_LATEST', defaultValue: false,
                description: 'Push a mutable "latest" tag. MUST stay false — the ECR repos are IMMUTABLE (see terraform)')
+        booleanParam(name: 'DEPLOY', defaultValue: true,
+               description: 'Deploy the freshly pushed tag to EKS with Helm. Turn off to build and publish only')
+        string(name: 'CLUSTER_NAME', defaultValue: 'vprofile-eks',
+               description: 'EKS cluster to deploy into')
+        string(name: 'K8S_NAMESPACE', defaultValue: 'vprofile',
+               description: 'Target namespace')
+        string(name: 'HELM_RELEASE', defaultValue: 'vprofile',
+               description: 'Helm release name. Changing this creates a SECOND parallel deployment, it does not rename the existing one')
+        string(name: 'DB_SECRET_NAME', defaultValue: 'db01-credentials',
+               description: 'Pre-existing Secret holding MYSQL_ROOT_PASSWORD. Created out of band so no credential ever enters the pipeline, the chart or Git')
+        string(name: 'HELM_TIMEOUT', defaultValue: '10m',
+               description: 'How long Helm waits for every workload to become Ready before rolling back')
         booleanParam(name: 'PARALLEL', defaultValue: false,
                description: 'Build/scan images in parallel. Risky while SonarQube shares this box — only enable on a larger agent')
     }
@@ -287,6 +399,9 @@ pipeline {
         SONAR_CACHE      = "${params.SONAR_CACHE_DIR}"
         SONAR_HOST_URL   = "${params.SONAR_HOST_URL}"
         REPO_URL         = 'https://github.com/yousefsalemW/DEVSECOPS-PLATFORM-EKS'
+        // Build-scoped kubeconfig. Deliberately NOT ~/.kube/config: the pipeline
+        // must not depend on, or disturb, whatever an operator set up by hand.
+        KUBECONFIG       = "${WORKSPACE}/.kube/config"
     }
 
     stages {
@@ -396,6 +511,38 @@ pipeline {
         // ---------- 8. Verify images exist in ECR ------------------------------
         stage('Verify') {
             steps { script { IMAGES.each { img -> verifyImage(img) } } }
+        }
+
+        // ---------- 9. Deploy to EKS -------------------------------------------
+        // Runs only after every image is built, scanned and confirmed present in
+        // ECR, so the tag deployed here is provably the tag that passed the gates.
+        stage('Deploy') {
+            when { expression { params.DEPLOY } }
+            steps {
+                script {
+                    preflight()
+                    renderManifests()
+                    deployRelease()
+                    verifyRollout()
+                    smokeTest()
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "rendered-*.yaml", allowEmptyArchive: true
+                }
+                failure {
+                    script {
+                        echo '--- deploy failed: helm --atomic has rolled the release back ---'
+                        sh """
+                            helm -n ${params.K8S_NAMESPACE} history ${params.HELM_RELEASE} || true
+                            kubectl -n ${params.K8S_NAMESPACE} get pods || true
+                            kubectl -n ${params.K8S_NAMESPACE} get events \
+                              --sort-by=.lastTimestamp | tail -30 || true
+                        """
+                    }
+                }
+            }
         }
     }
 

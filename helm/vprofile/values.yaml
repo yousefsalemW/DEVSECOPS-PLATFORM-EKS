@@ -83,6 +83,19 @@ storage:
   className: gp3
   size: 8Gi
 
+# PodDisruptionBudgets. See templates/70-pdb.yaml for the db01 trade-off -
+# with one replica, minAvailable:1 means node drains BLOCK rather than take the
+# database down unannounced. That is intended, but it is a choice.
+podDisruptionBudgets:
+  enabled: true
+  app:
+    minAvailable: 1      # 2 replicas -> one may be evicted at a time
+  web:
+    minAvailable: 1      # 2 replicas -> one may be evicted at a time
+  database:
+    enabled: true
+    minAvailable: 1      # 1 replica  -> blocks voluntary eviction entirely
+
 ingress:
   enabled: true
   className: alb

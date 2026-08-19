@@ -1,0 +1,62 @@
+{{- if .Values.podDisruptionBudgets.enabled }}
+# =============================================================================
+#  PodDisruptionBudgets
+#
+#  A PDB constrains VOLUNTARY disruptions only - `kubectl drain`, a node group
+#  upgrade, a cluster autoscaler scale-down. It does NOT protect against a node
+#  crashing, a kernel panic, or an AZ failure. Nothing does, at this replica
+#  count; that is what the RDS Multi-AZ recommendation is for.
+#
+#  What it buys today: a routine EKS node upgrade currently evicts db01
+#  immediately and takes the whole application down without asking anyone.
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: app01
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudgets.app.minAvailable }}
+  selector:
+    matchLabels:
+      app: app01
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vproweb
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudgets.web.minAvailable }}
+  selector:
+    matchLabels:
+      app: vproweb
+{{- if .Values.podDisruptionBudgets.database.enabled }}
+---
+# db01 runs a SINGLE replica, so this PDB behaves differently from the two above.
+#
+#   minAvailable: 1  +  1 replica  =  the pod can never be voluntarily evicted.
+#
+# That is deliberate, and it is a trade-off you have to actually want:
+#   GOOD - `kubectl drain` and managed node group upgrades STOP and report,
+#          instead of silently taking the database (and the whole app) down.
+#          A planned outage beats a surprise one.
+#   COST - node upgrades will not proceed on their own. You must consciously
+#          intervene:
+#             kubectl -n vprofile delete pdb db01     # then drain, then redeploy
+#          or plan a maintenance window.
+#
+# Set podDisruptionBudgets.database.enabled=false to drop this behaviour, e.g.
+# if a node group upgrade is stalling and you accept the brief outage.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db01
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudgets.database.minAvailable }}
+  selector:
+    matchLabels:
+      app: db01
+{{- end }}
+{{- end }}

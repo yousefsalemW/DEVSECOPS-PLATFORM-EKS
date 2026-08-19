@@ -51,6 +51,10 @@ spec:
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits:   { memory: 32Mi }
+          # The initContainer is a container too - busybox runs as root by
+          # default, and a permissive init is a permissive pod.
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" .Values.securityContext.app) | nindent 12 }}
       containers:
         - name: tomcat
           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-app") }}
@@ -81,4 +85,6 @@ spec:
             httpGet: { path: /login, port: 8080 }
             initialDelaySeconds: 120
             periodSeconds: 20
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" .Values.securityContext.app) | nindent 12 }}
           resources: {{- toYaml .Values.app.resources | nindent 12 }}

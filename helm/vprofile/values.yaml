@@ -34,6 +34,51 @@ db:
   # The chart then creates the Secret itself.
   rootPassword: ""
 
+# =============================================================================
+#  Pod security. Applied per component because the five images genuinely differ:
+#  only two of them run as a non-root user, and only one needs a privileged port.
+#  Verified against the running pods, not assumed:
+#    app01   uid 999   (tomcat)      mc01  uid 11211 (memcache)
+#    db01 / rmq01 / vproweb  run as root BY IMAGE DESIGN - their entrypoints
+#    start privileged, then drop down themselves (gosu) or need port 80.
+#
+#  readOnlyRootFilesystem is NOT set yet: Tomcat writes to work/ and temp/,
+#  nginx to /var/cache/nginx, MySQL to its datadir. That needs emptyDir volumes
+#  per component and is a separate, riskier change.
+# =============================================================================
+security:
+  # Applied to every container. Safe everywhere.
+  common:
+    allowPrivilegeEscalation: false
+    seccompProfile:
+      type: RuntimeDefault
+
+# Capabilities that must be ADDED BACK for the three root containers.
+# Dropping ALL is correct for a container that simply runs as its final user,
+# but these three start as root ON PURPOSE and then drop down themselves:
+#   mysql / rabbitmq : entrypoint chowns the data dir, then `gosu <user>`
+#   nginx            : master binds :80, then spawns workers as the nginx user
+# A root process with an EMPTY capability set cannot call setuid() - it gets
+# EPERM - so `drop: ALL` alone makes all three fail at startup.
+capabilities:
+  # chown the data dir, then switch user
+  privilegeDropper: ["CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID"]
+  # the same, plus binding a port below 1024
+  webServer: ["CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID", "NET_BIND_SERVICE"]
+
+securityContext:
+  # uid 999 - set explicitly because the image declares USER by NAME, and
+  # runAsNonRoot cannot verify a named user: the kubelet refuses the pod with
+  # "has runAsNonRoot and image has non-numeric user".
+  app:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+  mc:
+    runAsNonRoot: true
+    runAsUser: 11211
+    runAsGroup: 11211
+
 storage:
   className: gp3
   size: 8Gi

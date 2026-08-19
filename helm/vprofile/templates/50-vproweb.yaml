@@ -44,4 +44,9 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
             failureThreshold: 12
+          # nginx needs more than the usual drop-everything: the master binds
+          # :80 (NET_BIND_SERVICE) AND spawns workers as the nginx user
+          # (SETUID/SETGID), because the image's nginx.conf still says "user nginx".
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" dict "add" .Values.capabilities.webServer) | nindent 12 }}
           resources: {{- toYaml .Values.web.resources | nindent 12 }}

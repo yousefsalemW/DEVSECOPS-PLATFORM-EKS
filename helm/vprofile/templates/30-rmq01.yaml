@@ -41,4 +41,7 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 15
             failureThreshold: 8
+          # Root by image design - the entrypoint drops privileges with gosu.
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" dict "add" .Values.capabilities.privilegeDropper) | nindent 12 }}
           resources: {{- toYaml .Values.rabbitmq.resources | nindent 12 }}

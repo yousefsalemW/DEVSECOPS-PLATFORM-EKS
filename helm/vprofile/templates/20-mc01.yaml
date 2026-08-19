@@ -36,4 +36,6 @@ spec:
           readinessProbe:
             tcpSocket: { port: 11211 }
             initialDelaySeconds: 5
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" .Values.securityContext.mc) | nindent 12 }}
           resources: {{- toYaml .Values.memcached.resources | nindent 12 }}

@@ -77,6 +77,11 @@ spec:
                 - mysqladmin ping -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
             initialDelaySeconds: 120
             periodSeconds: 20
+          # Runs as root by image design: the MySQL entrypoint needs it to fix
+          # datadir ownership, then drops to the mysql user itself. Forcing a uid
+          # here risks breaking startup against the existing PVC.
+          securityContext:
+            {{- include "vprofile.containerSecurity" (dict "root" . "extra" dict "add" .Values.capabilities.privilegeDropper) | nindent 12 }}
           resources: {{- toYaml .Values.database.resources | nindent 12 }}
   volumeClaimTemplates:
     - metadata:

@@ -31,3 +31,24 @@ db01-credentials
 {{- fail "db credentials missing: set db.existingSecret (preferred) or --set db.rootPassword=... at install time" -}}
 {{- end -}}
 {{- end }}
+
+{{/* Container securityContext. Every container gets the common hardening;
+     `extra` carries the per-component parts (runAsUser, capability exceptions).
+     Usage: {{- include "vprofile.containerSecurity" (dict "root" . "extra" .Values.securityContext.app) | nindent 10 }} */}}
+{{- define "vprofile.containerSecurity" -}}
+allowPrivilegeEscalation: {{ .root.Values.security.common.allowPrivilegeEscalation }}
+seccompProfile:
+  type: {{ .root.Values.security.common.seccompProfile.type }}
+capabilities:
+  drop:
+    - ALL
+{{- with .add }}
+  add:
+{{- range . }}
+    - {{ . }}
+{{- end }}
+{{- end }}
+{{- with .extra }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}

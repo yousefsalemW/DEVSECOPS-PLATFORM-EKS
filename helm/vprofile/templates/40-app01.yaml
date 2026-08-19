@@ -74,6 +74,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "vprofile.dbSecretName" . }}
                   key: MYSQL_ROOT_PASSWORD
+            # Same override mechanism for the broker: RABBITMQ_USERNAME and
+            # RABBITMQ_PASSWORD resolve ${rabbitmq.username} and
+            # ${rabbitmq.password} in appconfig-rabbitmq.xml ahead of the
+            # placeholders compiled into the WAR.
+            - name: RABBITMQ_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vprofile.rmqSecretName" . }}
+                  key: RABBITMQ_DEFAULT_USER
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vprofile.rmqSecretName" . }}
+                  key: RABBITMQ_DEFAULT_PASS
           # /login is the first page that returns 200. / returns a 302 redirect,
           # which a probe with default success codes treats as a failure.
           readinessProbe:

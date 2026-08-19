@@ -135,6 +135,13 @@ memcached:
     limits:   { memory: 192Mi }
 
 rabbitmq:
+  # Credentials. Same pattern as the database: the value compiled into the WAR
+  # is a placeholder, and the real one arrives as an environment variable that
+  # Spring's PropertySourcesPlaceholderConfigurer resolves AHEAD of the
+  # properties file. The image default guest/guest is publicly documented.
+  existingSecret: ""   # preferred - must hold RABBITMQ_DEFAULT_USER and RABBITMQ_DEFAULT_PASS
+  username: ""         # only used when the chart creates the Secret itself
+  password: ""
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { memory: 512Mi }

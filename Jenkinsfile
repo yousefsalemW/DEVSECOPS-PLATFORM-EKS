@@ -367,12 +367,12 @@ pipeline {
                description: 'Heap cap for the Maven JVM inside the app image build. Keep this bounded — SonarQube shares the 8 GB on this box')
         booleanParam(name: 'RUN_SONAR', defaultValue: true,
                description: 'Run Maven verify + SonarQube analysis')
-        booleanParam(name: 'SONAR_GATE', defaultValue: false,
-               description: 'Audit mode when false: the analysis is published but the gate verdict never blocks the build. Set true to fail on a failing quality gate')
+        booleanParam(name: 'SONAR_GATE', defaultValue: true,
+               description: 'ENFORCED: a failing quality gate stops the build before any image is built. Set false to drop back to audit mode - publish the verdict, do not act on it')
         booleanParam(name: 'SKIP_TESTS', defaultValue: false,
                description: 'Skip unit tests during Maven verify. Leaves SonarQube with no coverage data — only for debugging the pipeline')
-        booleanParam(name: 'SECURITY_GATE', defaultValue: false,
-               description: 'Audit mode when false: scan + SBOM still run and are archived, but findings never block the push. Set true to fail the build on GATE_SEVERITY findings')
+        booleanParam(name: 'SECURITY_GATE', defaultValue: true,
+               description: 'ENFORCED: fixable GATE_SEVERITY findings fail the build BEFORE ECR login, so a vulnerable image never reaches the registry. Accepted risks belong in Build-Images/.trivyignore, not in a lowered GATE_SEVERITY')
         booleanParam(name: 'PUSH_LATEST', defaultValue: false,
                description: 'Push a mutable "latest" tag. MUST stay false — the ECR repos are IMMUTABLE (see terraform)')
         booleanParam(name: 'DEPLOY', defaultValue: true,

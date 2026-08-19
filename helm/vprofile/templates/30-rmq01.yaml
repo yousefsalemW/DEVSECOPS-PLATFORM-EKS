@@ -1,3 +1,18 @@
+{{- include "vprofile.requireRmqSecret" . }}
+{{- if not .Values.rabbitmq.existingSecret }}
+# Only rendered when credentials came in via --set. With rabbitmq.existingSecret
+# the chart touches no credential at all - the path Vault will take over.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rmq01-credentials
+  labels: {{- include "vprofile.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  RABBITMQ_DEFAULT_USER: {{ .Values.rabbitmq.username | quote }}
+  RABBITMQ_DEFAULT_PASS: {{ .Values.rabbitmq.password | quote }}
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -33,8 +48,11 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: 5672
-          # The app connects as guest/guest, which is the image default — so no
-          # credentials are set here on purpose.
+          # The image default guest/guest is publicly documented, so the broker
+          # is given real credentials from a Secret instead.
+          envFrom:
+            - secretRef:
+                name: {{ include "vprofile.rmqSecretName" . }}
           readinessProbe:
             exec:
               command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]

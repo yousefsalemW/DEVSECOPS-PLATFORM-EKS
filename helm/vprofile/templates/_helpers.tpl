@@ -52,3 +52,21 @@ capabilities:
 {{ toYaml . }}
 {{- end }}
 {{- end }}
+
+{{/* Name of the Secret holding the RabbitMQ credentials - the one the user
+     brought, or the one this chart creates. rmq01 and app01 both call this, so
+     the broker and the application can never point at different Secrets. */}}
+{{- define "vprofile.rmqSecretName" -}}
+{{- if .Values.rabbitmq.existingSecret -}}
+{{- .Values.rabbitmq.existingSecret -}}
+{{- else -}}
+rmq01-credentials
+{{- end -}}
+{{- end }}
+
+{{/* Fail the render rather than shipping a broker with no credentials. */}}
+{{- define "vprofile.requireRmqSecret" -}}
+{{- if and (not .Values.rabbitmq.existingSecret) (or (not .Values.rabbitmq.username) (not .Values.rabbitmq.password)) -}}
+{{- fail "rabbitmq credentials missing: set rabbitmq.existingSecret (preferred), or both rabbitmq.username and rabbitmq.password at install time" -}}
+{{- end -}}
+{{- end }}

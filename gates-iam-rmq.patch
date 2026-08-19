@@ -1,0 +1,162 @@
+diff --git a/Build-Images/src/main/resources/application.properties b/Build-Images/src/main/resources/application.properties
+index b0b545b..a410f86 100755
+--- a/Build-Images/src/main/resources/application.properties
++++ b/Build-Images/src/main/resources/application.properties
+@@ -16,7 +16,7 @@ memcached.standBy.port=11211
+ rabbitmq.address=rmq01
+ rabbitmq.port=5672
+ rabbitmq.username=guest
+-rabbitmq.password=guest
++rabbitmq.password=CHANGEME_PROVIDED_AT_RUNTIME
+ 
+ #Elasticesearch Configuration
+ elasticsearch.host =vprosearch01
+diff --git a/Jenkinsfile b/Jenkinsfile
+index f40e26b..e1e0677 100644
+--- a/Jenkinsfile
++++ b/Jenkinsfile
+@@ -367,12 +367,12 @@ pipeline {
+                description: 'Heap cap for the Maven JVM inside the app image build. Keep this bounded — SonarQube shares the 8 GB on this box')
+         booleanParam(name: 'RUN_SONAR', defaultValue: true,
+                description: 'Run Maven verify + SonarQube analysis')
+-        booleanParam(name: 'SONAR_GATE', defaultValue: false,
+-               description: 'Audit mode when false: the analysis is published but the gate verdict never blocks the build. Set true to fail on a failing quality gate')
++        booleanParam(name: 'SONAR_GATE', defaultValue: true,
++               description: 'ENFORCED: a failing quality gate stops the build before any image is built. Set false to drop back to audit mode - publish the verdict, do not act on it')
+         booleanParam(name: 'SKIP_TESTS', defaultValue: false,
+                description: 'Skip unit tests during Maven verify. Leaves SonarQube with no coverage data — only for debugging the pipeline')
+-        booleanParam(name: 'SECURITY_GATE', defaultValue: false,
+-               description: 'Audit mode when false: scan + SBOM still run and are archived, but findings never block the push. Set true to fail the build on GATE_SEVERITY findings')
++        booleanParam(name: 'SECURITY_GATE', defaultValue: true,
++               description: 'ENFORCED: fixable GATE_SEVERITY findings fail the build BEFORE ECR login, so a vulnerable image never reaches the registry. Accepted risks belong in Build-Images/.trivyignore, not in a lowered GATE_SEVERITY')
+         booleanParam(name: 'PUSH_LATEST', defaultValue: false,
+                description: 'Push a mutable "latest" tag. MUST stay false — the ECR repos are IMMUTABLE (see terraform)')
+         booleanParam(name: 'DEPLOY', defaultValue: true,
+diff --git a/helm/vprofile/templates/30-rmq01.yaml b/helm/vprofile/templates/30-rmq01.yaml
+index 493d229..d9ee284 100644
+--- a/helm/vprofile/templates/30-rmq01.yaml
++++ b/helm/vprofile/templates/30-rmq01.yaml
+@@ -1,3 +1,18 @@
++{{- include "vprofile.requireRmqSecret" . }}
++{{- if not .Values.rabbitmq.existingSecret }}
++# Only rendered when credentials came in via --set. With rabbitmq.existingSecret
++# the chart touches no credential at all - the path Vault will take over.
++apiVersion: v1
++kind: Secret
++metadata:
++  name: rmq01-credentials
++  labels: {{- include "vprofile.labels" . | nindent 4 }}
++type: Opaque
++stringData:
++  RABBITMQ_DEFAULT_USER: {{ .Values.rabbitmq.username | quote }}
++  RABBITMQ_DEFAULT_PASS: {{ .Values.rabbitmq.password | quote }}
++---
++{{- end }}
+ apiVersion: v1
+ kind: Service
+ metadata:
+@@ -33,8 +48,11 @@ spec:
+           imagePullPolicy: {{ .Values.image.pullPolicy }}
+           ports:
+             - containerPort: 5672
+-          # The app connects as guest/guest, which is the image default — so no
+-          # credentials are set here on purpose.
++          # The image default guest/guest is publicly documented, so the broker
++          # is given real credentials from a Secret instead.
++          envFrom:
++            - secretRef:
++                name: {{ include "vprofile.rmqSecretName" . }}
+           readinessProbe:
+             exec:
+               command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+diff --git a/helm/vprofile/templates/40-app01.yaml b/helm/vprofile/templates/40-app01.yaml
+index 713d1eb..01e49bc 100644
+--- a/helm/vprofile/templates/40-app01.yaml
++++ b/helm/vprofile/templates/40-app01.yaml
+@@ -74,6 +74,20 @@ spec:
+                 secretKeyRef:
+                   name: {{ include "vprofile.dbSecretName" . }}
+                   key: MYSQL_ROOT_PASSWORD
++            # Same override mechanism for the broker: RABBITMQ_USERNAME and
++            # RABBITMQ_PASSWORD resolve ${rabbitmq.username} and
++            # ${rabbitmq.password} in appconfig-rabbitmq.xml ahead of the
++            # placeholders compiled into the WAR.
++            - name: RABBITMQ_USERNAME
++              valueFrom:
++                secretKeyRef:
++                  name: {{ include "vprofile.rmqSecretName" . }}
++                  key: RABBITMQ_DEFAULT_USER
++            - name: RABBITMQ_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: {{ include "vprofile.rmqSecretName" . }}
++                  key: RABBITMQ_DEFAULT_PASS
+           # /login is the first page that returns 200. / returns a 302 redirect,
+           # which a probe with default success codes treats as a failure.
+           readinessProbe:
+diff --git a/helm/vprofile/templates/_helpers.tpl b/helm/vprofile/templates/_helpers.tpl
+index 7fcee67..c707da4 100644
+--- a/helm/vprofile/templates/_helpers.tpl
++++ b/helm/vprofile/templates/_helpers.tpl
+@@ -52,3 +52,21 @@ capabilities:
+ {{ toYaml . }}
+ {{- end }}
+ {{- end }}
++
++{{/* Name of the Secret holding the RabbitMQ credentials - the one the user
++     brought, or the one this chart creates. rmq01 and app01 both call this, so
++     the broker and the application can never point at different Secrets. */}}
++{{- define "vprofile.rmqSecretName" -}}
++{{- if .Values.rabbitmq.existingSecret -}}
++{{- .Values.rabbitmq.existingSecret -}}
++{{- else -}}
++rmq01-credentials
++{{- end -}}
++{{- end }}
++
++{{/* Fail the render rather than shipping a broker with no credentials. */}}
++{{- define "vprofile.requireRmqSecret" -}}
++{{- if and (not .Values.rabbitmq.existingSecret) (or (not .Values.rabbitmq.username) (not .Values.rabbitmq.password)) -}}
++{{- fail "rabbitmq credentials missing: set rabbitmq.existingSecret (preferred), or both rabbitmq.username and rabbitmq.password at install time" -}}
++{{- end -}}
++{{- end }}
+diff --git a/helm/vprofile/values.yaml b/helm/vprofile/values.yaml
+index f2df088..57e391b 100644
+--- a/helm/vprofile/values.yaml
++++ b/helm/vprofile/values.yaml
+@@ -135,6 +135,13 @@ memcached:
+     limits:   { memory: 192Mi }
+ 
+ rabbitmq:
++  # Credentials. Same pattern as the database: the value compiled into the WAR
++  # is a placeholder, and the real one arrives as an environment variable that
++  # Spring's PropertySourcesPlaceholderConfigurer resolves AHEAD of the
++  # properties file. The image default guest/guest is publicly documented.
++  existingSecret: ""   # preferred - must hold RABBITMQ_DEFAULT_USER and RABBITMQ_DEFAULT_PASS
++  username: ""         # only used when the chart creates the Secret itself
++  password: ""
+   resources:
+     requests: { cpu: 100m, memory: 256Mi }
+     limits:   { memory: 512Mi }
+diff --git a/terraform/eks.tf b/terraform/eks.tf
+index 69671a8..c9d3c04 100644
+--- a/terraform/eks.tf
++++ b/terraform/eks.tf
+@@ -125,7 +125,14 @@ resource "aws_eks_access_entry" "jenkins" {
+ resource "aws_eks_access_policy_association" "jenkins_admin" {
+   cluster_name  = module.eks.cluster_name
+   principal_arn = aws_iam_role.jenkins.arn
+-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+-
+-  access_scope { type = "cluster" }
++  # EditPolicy scoped to one namespace is everything `helm upgrade --install`
++  # needs. ClusterAdmin gave every build - and anyone who can merge a commit -
++  # read access to every Secret in every namespace, including kube-system.
++  # Platform-level installs stay a human operation via bootstrap-addons.sh.
++  policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
++
++  access_scope {
++    type       = "namespace"
++    namespaces = ["vprofile"]
++  }
+ }

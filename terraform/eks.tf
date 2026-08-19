@@ -125,7 +125,14 @@ resource "aws_eks_access_entry" "jenkins" {
 resource "aws_eks_access_policy_association" "jenkins_admin" {
   cluster_name  = module.eks.cluster_name
   principal_arn = aws_iam_role.jenkins.arn
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  # EditPolicy scoped to one namespace is everything `helm upgrade --install`
+  # needs. ClusterAdmin gave every build - and anyone who can merge a commit -
+  # read access to every Secret in every namespace, including kube-system.
+  # Platform-level installs stay a human operation via bootstrap-addons.sh.
+  policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
 
-  access_scope { type = "cluster" }
+  access_scope {
+    type       = "namespace"
+    namespaces = ["vprofile"]
+  }
 }

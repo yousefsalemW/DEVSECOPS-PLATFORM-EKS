@@ -1,0 +1,174 @@
+# =============================================================================
+#  kube-prometheus-stack values  —  chart 88.5.0
+#
+#  Installed by platform/bootstrap-addons.sh into the `monitoring` namespace.
+#
+#  Two themes run through this file:
+#
+#   1. EKS DEFAULTS ARE WRONG OUT OF THE BOX. The chart assumes a self-managed
+#      control plane and tries to scrape etcd, kube-controller-manager,
+#      kube-scheduler and kube-proxy. On EKS those run on AWS-managed nodes you
+#      cannot reach. Left enabled they produce four permanently-firing alerts
+#      and empty dashboard panels from the first minute — which reads like a
+#      broken install. They are disabled below, and so are their alert rules.
+#
+#   2. THIS IS A SMALL CLUSTER. 3 nodes x 8 GiB, already running the app. Every
+#      component is given explicit requests and limits so monitoring cannot
+#      starve the workload it exists to observe.
+# =============================================================================
+
+# Not strictly needed (the script passes --namespace), but explicit is better:
+# it means `helm template` on its own produces the same namespaces as a real
+# install, so what you review is what you get.
+namespaceOverride: monitoring
+
+crds:
+  # Helm installs files in crds/ on INSTALL ONLY - it never upgrades or deletes
+  # them. That is a Helm limitation, not a chart bug. When bumping the chart
+  # version, apply the new CRDs manually first. See the note in the script.
+  enabled: true
+
+# -----------------------------------------------------------------------------
+#  Control plane scrape targets
+# -----------------------------------------------------------------------------
+kubeApiServer:
+  enabled: true      # reachable on EKS through the kubernetes service
+kubelet:
+  enabled: true      # scraped via the node's /metrics/cadvisor - works on EKS
+coreDns:
+  enabled: true      # runs as a normal pod, scrapeable
+
+kubeControllerManager:
+  enabled: false     # AWS-managed, not reachable
+kubeScheduler:
+  enabled: false     # AWS-managed, not reachable
+kubeEtcd:
+  enabled: false     # AWS-managed, not reachable
+kubeProxy:
+  enabled: false     # runs as a DaemonSet but binds 127.0.0.1 on EKS by default
+
+# -----------------------------------------------------------------------------
+#  Alert rules
+#  Disabling a scrape target is only half the job: the matching rule groups
+#  still get created and fire on absent metrics. Both halves are needed.
+# -----------------------------------------------------------------------------
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+    windows: false   # no Windows nodes
+
+# -----------------------------------------------------------------------------
+#  Prometheus
+# -----------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    # 7 days is a deliberate choice for a lab: long enough to see a trend across
+    # a working week, short enough that 10 GiB is comfortable. retentionSize is
+    # the safety net - Prometheus stops before it fills the volume, because a
+    # full PVC is an outage that also destroys the data you were keeping.
+    retention: 7d
+    retentionSize: 8GiB
+
+    # false = discover ServiceMonitors in EVERY namespace, not just ones this
+    # release created. This is what lets you add a ServiceMonitor in the
+    # `vprofile` namespace later and have it picked up automatically.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    resources:
+      requests: { cpu: 200m, memory: 1Gi }
+      limits:   { memory: 2Gi }
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+# -----------------------------------------------------------------------------
+#  Alertmanager
+#  NOTE: no receivers are configured. Alerts will fire and go NOWHERE. That is
+#  a deliberate, documented gap - wiring a real destination is a separate task.
+#  An alert nobody receives is not an alert.
+# -----------------------------------------------------------------------------
+alertmanager:
+  alertmanagerSpec:
+    retention: 120h
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits:   { memory: 128Mi }
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+
+# -----------------------------------------------------------------------------
+#  Grafana
+# -----------------------------------------------------------------------------
+grafana:
+  enabled: true
+
+  # Same contract as the database and broker credentials: the password is
+  # created out of band and never enters this file, the chart or Git.
+  #   kubectl -n monitoring create secret generic grafana-admin \
+  #     --from-literal=admin-user=admin \
+  #     --from-literal=admin-password='<strong password>'
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # No Ingress. Reached with a port-forward, like Jenkins and SonarQube.
+  # A second internet-facing ALB for a dashboard is cost and exposure with no
+  # benefit on a lab cluster.
+  ingress:
+    enabled: false
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 2Gi
+
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { memory: 256Mi }
+
+  # Pre-load the standard Kubernetes dashboard set. Without this Grafana starts
+  # empty and every dashboard is a manual import.
+  defaultDashboardsEnabled: true
+  defaultDashboardsTimezone: Africa/Cairo
+
+# -----------------------------------------------------------------------------
+#  Exporters and operator
+# -----------------------------------------------------------------------------
+kubeStateMetrics:
+  enabled: true      # object state: replica counts, pod phase, PVC status
+kube-state-metrics:
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits:   { memory: 192Mi }
+
+nodeExporter:
+  enabled: true      # node CPU / memory / disk / network
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits:   { memory: 64Mi }
+
+prometheusOperator:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { memory: 256Mi }

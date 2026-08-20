@@ -11,6 +11,7 @@
 #  WHAT IT INSTALLS (idempotent — safe to re-run):
 #    1. gp3 StorageClass, made default (gp2 demoted)
 #    2. AWS Load Balancer Controller, bound to the existing IRSA role
+#    3. kube-prometheus-stack (Prometheus, Grafana, Alertmanager, exporters)
 #
 #  WHAT IT DELIBERATELY DOES NOT DO:
 #    vpc-cni's enableNetworkPolicy is an AWS API call, not a Kubernetes one, so
@@ -26,6 +27,16 @@ CLUSTER_NAME="${CLUSTER_NAME:-vprofile-eks}"
 AWS_REGION="${AWS_REGION:-eu-west-3}"
 LB_ROLE_NAME="${LB_ROLE_NAME:-vprofile-lb-controller}"   # created by module.lb_role
 LB_CHART_VERSION="${LB_CHART_VERSION:-1.13.4}"
+
+# Every chart version lives here, together. This is the same guarantee a
+# Chart.lock gives an umbrella chart: one place to read, one place to change,
+# and nothing floats. An umbrella was considered and rejected - three of the
+# four platform charts hardcode .Release.Namespace and cannot be redirected,
+# so an umbrella would force them into one namespace. See
+# Guides/PLATFORM-ADDONS-ARCHITECTURE-GUIDE.md for the full reasoning.
+MONITORING_CHART_VERSION="${MONITORING_CHART_VERSION:-88.5.0}"
+MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
+GRAFANA_SECRET="${GRAFANA_SECRET:-grafana-admin}"
 
 log() { echo "[addons] $*"; }
 
@@ -52,7 +63,7 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
 kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
 
 ###############################################################################
-log "1/2 — gp3 StorageClass"
+log "1/3 — gp3 StorageClass"
 ###############################################################################
 # The EBS CSI driver addon is already installed by terraform; this only adds the
 # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
@@ -83,7 +94,7 @@ fi
 kubectl get storageclass
 
 ###############################################################################
-log "2/2 — AWS Load Balancer Controller"
+log "2/3 — AWS Load Balancer Controller"
 ###############################################################################
 # The IRSA trust policy in terraform is scoped to exactly
 # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
@@ -112,6 +123,57 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --wait --timeout 5m
 
 ###############################################################################
+log "3/3 — kube-prometheus-stack"
+###############################################################################
+# Grafana's admin password is created out of band, exactly like the database and
+# broker credentials: it never enters this script, the values file, or Git.
+kubectl get namespace "${MONITORING_NAMESPACE}" >/dev/null 2>&1 \
+  || kubectl create namespace "${MONITORING_NAMESPACE}"
+
+if ! kubectl -n "${MONITORING_NAMESPACE}" get secret "${GRAFANA_SECRET}" >/dev/null 2>&1; then
+  log "Secret '${GRAFANA_SECRET}' not found in namespace '${MONITORING_NAMESPACE}'."
+  log "The monitoring values reference it (grafana.admin.existingSecret). Create it once:"
+  log "  kubectl -n ${MONITORING_NAMESPACE} create secret generic ${GRAFANA_SECRET} \\"
+  log "    --from-literal=admin-user=admin \\"
+  log "    --from-literal=admin-password='<strong password>'"
+  exit 1
+fi
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
+helm repo update prometheus-community >/dev/null
+
+# NOTE ON CRDs: Helm installs files in a chart's crds/ directory on INSTALL only.
+# It never upgrades or deletes them. That is a documented Helm limitation, not a
+# chart bug. When bumping MONITORING_CHART_VERSION across a major release, apply
+# the new CRDs by hand FIRST, or the operator silently runs against a stale API:
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/<ver>/example/prometheus-operator-crd/...
+helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace "${MONITORING_NAMESPACE}" \
+  --version "${MONITORING_CHART_VERSION}" \
+  --values "$(dirname "$0")/values/monitoring.yaml" \
+  --wait --timeout 10m
+
+kubectl -n "${MONITORING_NAMESPACE}" rollout status \
+  deploy/kube-prometheus-stack-operator --timeout=5m
+kubectl -n "${MONITORING_NAMESPACE}" rollout status \
+  deploy/kube-prometheus-stack-grafana --timeout=5m
+
+# The Operator materialises Prometheus and Alertmanager as StatefulSets from the
+# CRs, so they appear a moment after helm returns - hence a separate wait.
+log "waiting for the operator to materialise Prometheus and Alertmanager"
+for _ in $(seq 1 30); do
+  if kubectl -n "${MONITORING_NAMESPACE}" get statefulset \
+       prometheus-kube-prometheus-stack-prometheus >/dev/null 2>&1; then
+    break
+  fi
+  sleep 10
+done
+kubectl -n "${MONITORING_NAMESPACE}" rollout status \
+  statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=10m || \
+  log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
+
+###############################################################################
 log "verifying"
 ###############################################################################
 kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=3m
@@ -121,4 +183,17 @@ kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --time
 kubectl get crd targetgroupbindings.elbv2.k8s.aws >/dev/null \
   && log "TargetGroupBinding CRD present"
 
-log "done — the cluster can now serve Ingress and provision gp3 volumes"
+kubectl -n "${MONITORING_NAMESPACE}" get pods --no-headers \
+  | awk '{print "[addons]   " $1 " " $3}'
+
+log ""
+log "Grafana is NOT exposed - reach it with a port-forward, like Jenkins:"
+log "  kubectl -n ${MONITORING_NAMESPACE} port-forward svc/kube-prometheus-stack-grafana 3000:80"
+log "  then http://localhost:3000  (user from the ${GRAFANA_SECRET} secret)"
+log ""
+log "KNOWN GAPS, deliberately not covered here:"
+log "  - Alertmanager has NO receivers. Alerts fire and go nowhere."
+log "  - No log aggregation (Loki / Fluent Bit)."
+log "  - The application exposes no JVM metrics - infrastructure only."
+
+log "done — the cluster can serve Ingress, provision gp3 volumes, and is monitored"

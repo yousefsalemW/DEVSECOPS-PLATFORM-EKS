@@ -12,6 +12,7 @@
 #    1. gp3 StorageClass, made default (gp2 demoted)
 #    2. AWS Load Balancer Controller, bound to the existing IRSA role
 #    3. kube-prometheus-stack (Prometheus, Grafana, Alertmanager, exporters)
+#    4. Velero (backups to S3 + EBS snapshots)
 #
 #  WHAT IT DELIBERATELY DOES NOT DO:
 #    vpc-cni's enableNetworkPolicy is an AWS API call, not a Kubernetes one, so
@@ -37,6 +38,8 @@ LB_CHART_VERSION="${LB_CHART_VERSION:-1.13.4}"
 MONITORING_CHART_VERSION="${MONITORING_CHART_VERSION:-88.5.0}"
 MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
 GRAFANA_SECRET="${GRAFANA_SECRET:-grafana-admin}"
+VELERO_CHART_VERSION="${VELERO_CHART_VERSION:-12.1.0}"
+VELERO_NAMESPACE="${VELERO_NAMESPACE:-velero}"
 
 log() { echo "[addons] $*"; }
 
@@ -63,7 +66,7 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
 kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
 
 ###############################################################################
-log "1/3 — gp3 StorageClass"
+log "1/4 — gp3 StorageClass"
 ###############################################################################
 # The EBS CSI driver addon is already installed by terraform; this only adds the
 # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
@@ -94,7 +97,7 @@ fi
 kubectl get storageclass
 
 ###############################################################################
-log "2/3 — AWS Load Balancer Controller"
+log "2/4 — AWS Load Balancer Controller"
 ###############################################################################
 # The IRSA trust policy in terraform is scoped to exactly
 # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
@@ -123,7 +126,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --wait --timeout 5m
 
 ###############################################################################
-log "3/3 — kube-prometheus-stack"
+log "3/4 — kube-prometheus-stack"
 ###############################################################################
 # Grafana's admin password is created out of band, exactly like the database and
 # broker credentials: it never enters this script, the values file, or Git.
@@ -174,6 +177,60 @@ kubectl -n "${MONITORING_NAMESPACE}" rollout status \
   log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
 
 ###############################################################################
+log "4/4 — Velero"
+###############################################################################
+# The bucket and IAM role are created by terraform/velero.tf. Both are read
+# from live AWS rather than hardcoded, for the same reason ECR_REGISTRY is
+# derived at runtime: the script then works in any account without editing.
+VELERO_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/vprofile-velero"
+
+VELERO_BUCKET="$(aws s3api list-buckets --region "${AWS_REGION}" \
+  --query "Buckets[?starts_with(Name, 'vprofile-velero-backups')].Name | [0]" \
+  --output text 2>/dev/null || true)"
+
+if [ -z "${VELERO_BUCKET}" ] || [ "${VELERO_BUCKET}" = "None" ]; then
+  log "no Velero bucket found. Run 'terraform apply' first - it creates the"
+  log "bucket and the IAM role that this step annotates the ServiceAccount with."
+  exit 1
+fi
+log "bucket ${VELERO_BUCKET}"
+log "role   ${VELERO_ROLE_ARN}"
+
+kubectl get namespace "${VELERO_NAMESPACE}" >/dev/null 2>&1 \
+  || kubectl create namespace "${VELERO_NAMESPACE}"
+
+helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts >/dev/null 2>&1 || true
+helm repo update vmware-tanzu >/dev/null
+
+helm upgrade --install velero vmware-tanzu/velero \
+  --namespace "${VELERO_NAMESPACE}" \
+  --version "${VELERO_CHART_VERSION}" \
+  --values "$(dirname "$0")/values/velero.yaml" \
+  --set "serviceAccount.server.annotations.eks\\.amazonaws\\.com/role-arn=${VELERO_ROLE_ARN}" \
+  --set "configuration.backupStorageLocation[0].bucket=${VELERO_BUCKET}" \
+  --wait --timeout 5m
+
+kubectl -n "${VELERO_NAMESPACE}" rollout status deploy/velero --timeout=5m
+
+# A BackupStorageLocation that cannot reach its bucket reports Unavailable and
+# every backup fails. Velero validates it on a timer, so give it a moment -
+# this catches a broken IRSA trust immediately instead of at 02:00 tomorrow.
+log "waiting for the BackupStorageLocation to validate"
+for _ in $(seq 1 18); do
+  phase="$(kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation default \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [ "${phase}" = "Available" ] && break
+  sleep 10
+done
+if [ "${phase:-}" = "Available" ]; then
+  log "BackupStorageLocation is Available"
+else
+  log "WARNING: BackupStorageLocation is '${phase:-unknown}', not Available."
+  log "  Almost always the IRSA trust: check that terraform trusts"
+  log "  ${VELERO_NAMESPACE}:velero-server and that the SA carries the role ARN."
+fi
+
+###############################################################################
 log "verifying"
 ###############################################################################
 kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=3m
@@ -191,9 +248,16 @@ log "Grafana is NOT exposed - reach it with a port-forward, like Jenkins:"
 log "  kubectl -n ${MONITORING_NAMESPACE} port-forward svc/kube-prometheus-stack-grafana 3000:80"
 log "  then http://localhost:3000  (user from the ${GRAFANA_SECRET} secret)"
 log ""
+kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation,schedule --no-headers 2>/dev/null \
+  | awk '{print "[addons]   " $1 " " $2}'
+
+log ""
 log "KNOWN GAPS, deliberately not covered here:"
 log "  - Alertmanager has NO receivers. Alerts fire and go nowhere."
+log "  - RESTORE HAS NEVER BEEN TESTED. An untested backup is a hypothesis."
+log "      velero backup create test --include-namespaces vprofile --wait"
+log "      velero restore create --from-backup test --namespace-mappings vprofile:vprofile-restore"
 log "  - No log aggregation (Loki / Fluent Bit)."
 log "  - The application exposes no JVM metrics - infrastructure only."
 
-log "done — the cluster can serve Ingress, provision gp3 volumes, and is monitored"
+log "done — Ingress, gp3 volumes, monitoring and backups are in place"

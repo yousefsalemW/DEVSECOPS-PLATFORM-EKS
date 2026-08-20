@@ -1,0 +1,457 @@
+diff --git a/helm/vprofile/templates/10-db01.yaml b/helm/vprofile/templates/10-db01.yaml
+index 790700c..a82d304 100644
+--- a/helm/vprofile/templates/10-db01.yaml
++++ b/helm/vprofile/templates/10-db01.yaml
+@@ -45,6 +45,29 @@ spec:
+       labels:
+         app: db01
+         {{- include "vprofile.labels" . | nindent 8 }}
++      {{- if .Values.backup.hooks.enabled }}
++      # Velero backup hooks. An EBS snapshot of a running MySQL volume is
++      # CRASH-consistent: pages may still be in the InnoDB buffer pool when the
++      # snapshot is taken. InnoDB usually recovers on restore - "usually" is not
++      # a backup strategy.
++      #
++      # The pre-hook writes a logical dump INTO the volume, so the snapshot
++      # captures both the (possibly crash-consistent) datadir AND a known-good
++      # dump. Restore path: attach the volume, then
++      #   mysql -uroot -p"$MYSQL_ROOT_PASSWORD" accounts < /var/lib/mysql/backup/dump.sql
++      #
++      # A FLUSH TABLES WITH READ LOCK hook would NOT work here: the lock is
++      # released the moment the hook's session ends, which is before the
++      # snapshot is taken. This is the common mistake.
++      annotations:
++        pre.hook.backup.velero.io/container: mysql
++        pre.hook.backup.velero.io/command: >-
++          ["/bin/sh","-c","mkdir -p /var/lib/mysql/backup && mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --routines --triggers --databases {{ .Values.db.name }} > /var/lib/mysql/backup/dump.sql"]
++        pre.hook.backup.velero.io/timeout: {{ .Values.backup.hooks.timeout | quote }}
++        # Non-zero exit fails the BACKUP, deliberately. A backup that silently
++        # skipped its consistency step is worse than a backup that failed loudly.
++        pre.hook.backup.velero.io/on-error: Fail
++      {{- end }}
+     spec:
+       containers:
+         - name: mysql
+diff --git a/helm/vprofile/values.yaml b/helm/vprofile/values.yaml
+index 57e391b..5910986 100644
+--- a/helm/vprofile/values.yaml
++++ b/helm/vprofile/values.yaml
+@@ -79,6 +79,13 @@ securityContext:
+     runAsUser: 11211
+     runAsGroup: 11211
+ 
++# Velero backup hooks on db01. See the annotations in templates/10-db01.yaml
++# for why a mysqldump is used rather than FLUSH TABLES WITH READ LOCK.
++backup:
++  hooks:
++    enabled: true
++    timeout: 5m
++
+ storage:
+   className: gp3
+   size: 8Gi
+diff --git a/platform/bootstrap-addons.sh b/platform/bootstrap-addons.sh
+index ecec42b..89bf053 100644
+--- a/platform/bootstrap-addons.sh
++++ b/platform/bootstrap-addons.sh
+@@ -12,6 +12,7 @@
+ #    1. gp3 StorageClass, made default (gp2 demoted)
+ #    2. AWS Load Balancer Controller, bound to the existing IRSA role
+ #    3. kube-prometheus-stack (Prometheus, Grafana, Alertmanager, exporters)
++#    4. Velero (backups to S3 + EBS snapshots)
+ #
+ #  WHAT IT DELIBERATELY DOES NOT DO:
+ #    vpc-cni's enableNetworkPolicy is an AWS API call, not a Kubernetes one, so
+@@ -37,6 +38,8 @@ LB_CHART_VERSION="${LB_CHART_VERSION:-1.13.4}"
+ MONITORING_CHART_VERSION="${MONITORING_CHART_VERSION:-88.5.0}"
+ MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
+ GRAFANA_SECRET="${GRAFANA_SECRET:-grafana-admin}"
++VELERO_CHART_VERSION="${VELERO_CHART_VERSION:-12.1.0}"
++VELERO_NAMESPACE="${VELERO_NAMESPACE:-velero}"
+ 
+ log() { echo "[addons] $*"; }
+ 
+@@ -63,7 +66,7 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
+ kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
+ 
+ ###############################################################################
+-log "1/3 — gp3 StorageClass"
++log "1/4 — gp3 StorageClass"
+ ###############################################################################
+ # The EBS CSI driver addon is already installed by terraform; this only adds the
+ # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
+@@ -94,7 +97,7 @@ fi
+ kubectl get storageclass
+ 
+ ###############################################################################
+-log "2/3 — AWS Load Balancer Controller"
++log "2/4 — AWS Load Balancer Controller"
+ ###############################################################################
+ # The IRSA trust policy in terraform is scoped to exactly
+ # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
+@@ -123,7 +126,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
+   --wait --timeout 5m
+ 
+ ###############################################################################
+-log "3/3 — kube-prometheus-stack"
++log "3/4 — kube-prometheus-stack"
+ ###############################################################################
+ # Grafana's admin password is created out of band, exactly like the database and
+ # broker credentials: it never enters this script, the values file, or Git.
+@@ -173,6 +176,60 @@ kubectl -n "${MONITORING_NAMESPACE}" rollout status \
+   statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=10m || \
+   log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
+ 
++###############################################################################
++log "4/4 — Velero"
++###############################################################################
++# The bucket and IAM role are created by terraform/velero.tf. Both are read
++# from live AWS rather than hardcoded, for the same reason ECR_REGISTRY is
++# derived at runtime: the script then works in any account without editing.
++VELERO_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/vprofile-velero"
++
++VELERO_BUCKET="$(aws s3api list-buckets --region "${AWS_REGION}" \
++  --query "Buckets[?starts_with(Name, 'vprofile-velero-backups')].Name | [0]" \
++  --output text 2>/dev/null || true)"
++
++if [ -z "${VELERO_BUCKET}" ] || [ "${VELERO_BUCKET}" = "None" ]; then
++  log "no Velero bucket found. Run 'terraform apply' first - it creates the"
++  log "bucket and the IAM role that this step annotates the ServiceAccount with."
++  exit 1
++fi
++log "bucket ${VELERO_BUCKET}"
++log "role   ${VELERO_ROLE_ARN}"
++
++kubectl get namespace "${VELERO_NAMESPACE}" >/dev/null 2>&1 \
++  || kubectl create namespace "${VELERO_NAMESPACE}"
++
++helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts >/dev/null 2>&1 || true
++helm repo update vmware-tanzu >/dev/null
++
++helm upgrade --install velero vmware-tanzu/velero \
++  --namespace "${VELERO_NAMESPACE}" \
++  --version "${VELERO_CHART_VERSION}" \
++  --values "$(dirname "$0")/values/velero.yaml" \
++  --set "serviceAccount.server.annotations.eks\\.amazonaws\\.com/role-arn=${VELERO_ROLE_ARN}" \
++  --set "configuration.backupStorageLocation[0].bucket=${VELERO_BUCKET}" \
++  --wait --timeout 5m
++
++kubectl -n "${VELERO_NAMESPACE}" rollout status deploy/velero --timeout=5m
++
++# A BackupStorageLocation that cannot reach its bucket reports Unavailable and
++# every backup fails. Velero validates it on a timer, so give it a moment -
++# this catches a broken IRSA trust immediately instead of at 02:00 tomorrow.
++log "waiting for the BackupStorageLocation to validate"
++for _ in $(seq 1 18); do
++  phase="$(kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation default \
++    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
++  [ "${phase}" = "Available" ] && break
++  sleep 10
++done
++if [ "${phase:-}" = "Available" ]; then
++  log "BackupStorageLocation is Available"
++else
++  log "WARNING: BackupStorageLocation is '${phase:-unknown}', not Available."
++  log "  Almost always the IRSA trust: check that terraform trusts"
++  log "  ${VELERO_NAMESPACE}:velero-server and that the SA carries the role ARN."
++fi
++
+ ###############################################################################
+ log "verifying"
+ ###############################################################################
+@@ -190,10 +247,17 @@ log ""
+ log "Grafana is NOT exposed - reach it with a port-forward, like Jenkins:"
+ log "  kubectl -n ${MONITORING_NAMESPACE} port-forward svc/kube-prometheus-stack-grafana 3000:80"
+ log "  then http://localhost:3000  (user from the ${GRAFANA_SECRET} secret)"
++log ""
++kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation,schedule --no-headers 2>/dev/null \
++  | awk '{print "[addons]   " $1 " " $2}'
++
+ log ""
+ log "KNOWN GAPS, deliberately not covered here:"
+ log "  - Alertmanager has NO receivers. Alerts fire and go nowhere."
++log "  - RESTORE HAS NEVER BEEN TESTED. An untested backup is a hypothesis."
++log "      velero backup create test --include-namespaces vprofile --wait"
++log "      velero restore create --from-backup test --namespace-mappings vprofile:vprofile-restore"
+ log "  - No log aggregation (Loki / Fluent Bit)."
+ log "  - The application exposes no JVM metrics - infrastructure only."
+ 
+-log "done — the cluster can serve Ingress, provision gp3 volumes, and is monitored"
++log "done — Ingress, gp3 volumes, monitoring and backups are in place"
+diff --git a/platform/values/velero.yaml b/platform/values/velero.yaml
+new file mode 100644
+index 0000000..ad6f620
+--- /dev/null
++++ b/platform/values/velero.yaml
+@@ -0,0 +1,121 @@
++# =============================================================================
++#  Velero values  —  chart 12.1.0 (Velero 1.18.1)
++#
++#  Installed by platform/bootstrap-addons.sh into the `velero` namespace.
++#  The bucket and IAM role come from terraform/velero.tf.
++#
++#  WHAT VELERO PROTECTS, AND WHAT IT DOES NOT
++#
++#    Protects well   Kubernetes objects — Deployments, Services, Secrets,
++#                    ConfigMaps, Ingress, RBAC. Namespace-level restore after
++#                    an accidental delete. Cluster rebuild.
++#
++#    Protects partly PersistentVolume data, via EBS snapshots. A snapshot of a
++#                    RUNNING MySQL volume is CRASH-consistent, not
++#                    application-consistent: pages may still sit in the InnoDB
++#                    buffer pool. It usually recovers. "Usually" is not a backup
++#                    strategy, which is why the hooks below exist.
++#
++#    Does NOT cover  The Terraform state (S3 versioning handles that), ECR
++#                    images (lifecycle policy), Jenkins configuration and job
++#                    history (unprotected — it lives on one EBS volume), and
++#                    the AWS infrastructure itself (Terraform is the recovery
++#                    mechanism, and it has never been tested end to end).
++# =============================================================================
++
++# The chart ships NO cloud provider plugin. Without this initContainer Velero
++# starts, reports healthy, and every backup fails with "unable to locate
++# provider aws". Pinned to the version this chart recommends for Velero 1.18.1.
++initContainers:
++  - name: velero-plugin-for-aws
++    image: velero/velero-plugin-for-aws:v1.13.1
++    imagePullPolicy: IfNotPresent
++    volumeMounts:
++      - mountPath: /target
++        name: plugins
++
++# IRSA, not a static key. terraform/velero.tf trusts exactly
++# velero:velero-server, so the namespace and name below are not free choices.
++serviceAccount:
++  server:
++    create: true
++    name: velero-server
++    annotations:
++      eks.amazonaws.com/role-arn: ""   # set by bootstrap-addons.sh at runtime
++
++# useSecret: false is what switches Velero from "read a credentials file" to
++# "use the pod's IRSA identity". Leaving it true makes Velero look for a Secret
++# that does not exist and fail at startup.
++credentials:
++  useSecret: false
++
++configuration:
++  backupStorageLocation:
++    - name: default
++      provider: aws
++      bucket: ""                       # set by bootstrap-addons.sh
++      default: true
++      config:
++        region: eu-west-3
++
++  volumeSnapshotLocation:
++    - name: default
++      provider: aws
++      config:
++        region: eu-west-3
++
++backupsEnabled: true
++snapshotsEnabled: true
++
++# The node agent (formerly restic) does file-level backup of volumes that have
++# no snapshot support. Every volume here is EBS, which snapshots natively, so
++# it would cost a DaemonSet pod per node for nothing. Turn it on the day a
++# workload uses a volume type EBS snapshots cannot cover.
++deployNodeAgent: false
++
++resources:
++  requests: { cpu: 100m, memory: 128Mi }
++  limits:   { memory: 512Mi }
++
++# -----------------------------------------------------------------------------
++#  Schedules
++#
++#  TTL is what expires the backup RECORD. The S3 lifecycle rule in
++#  terraform/velero.tf expires the OBJECTS, and is deliberately set longer
++#  (35d vs 30d) so Velero stays the component that decides what is current.
++#  If S3 expired objects first, Velero would list backups that cannot restore.
++# -----------------------------------------------------------------------------
++schedules:
++  daily-vprofile:
++    disabled: false
++    schedule: "0 2 * * *"              # 02:00 UTC — after the pre-backup dump
++    useOwnerReferencesInBackup: false
++    template:
++      ttl: "720h"                      # 30 days
++      includedNamespaces:
++        - vprofile
++      snapshotVolumes: true
++      # Hooks run per pod and are declared on the pod itself (see the db01
++      # annotations in the application chart), not here.
++
++  # The platform namespaces hold no data worth snapshotting - they are
++  # rebuildable from bootstrap-addons.sh. Object-only, and kept briefly, so a
++  # namespace deleted by accident can be put back.
++  weekly-platform:
++    disabled: false
++    schedule: "0 3 * * 0"              # Sunday 03:00 UTC
++    template:
++      ttl: "336h"                      # 14 days
++      includedNamespaces:
++        - monitoring
++        - velero
++      snapshotVolumes: false
++
++# Same hardening applied to the application workloads. Velero's server runs as
++# a normal process and needs no privileges beyond its IRSA identity.
++containerSecurityContext:
++  allowPrivilegeEscalation: false
++  capabilities:
++    drop: ["ALL"]
++  seccompProfile:
++    type: RuntimeDefault
+diff --git a/terraform/velero.tf b/terraform/velero.tf
+new file mode 100644
+index 0000000..34903bb
+--- /dev/null
++++ b/terraform/velero.tf
+@@ -0,0 +1,112 @@
++# =============================================================================
++#  Velero — backup storage and identity
++#
++#  Terraform owns the AWS half only: the bucket and the IAM role. The Velero
++#  server itself is installed by platform/bootstrap-addons.sh, because it talks
++#  to the Kubernetes API and the cluster endpoint is private.
++#
++#  SCOPE, stated honestly: Velero backs up Kubernetes OBJECTS and takes EBS
++#  snapshots. An EBS snapshot of a running MySQL volume is CRASH-consistent,
++#  not application-consistent - InnoDB usually recovers, but "usually" is not a
++#  backup strategy. The chart values add a pre-backup mysqldump hook to close
++#  that gap. See platform/values/velero.yaml.
++# =============================================================================
++
++resource "aws_s3_bucket" "velero" {
++  bucket = var.velero_bucket_name
++
++  # Backups are the thing you reach for when everything else failed. Refusing to
++  # delete the bucket while it still holds them is the correct default.
++  force_destroy = false
++
++  tags = {
++    Name    = var.velero_bucket_name
++    Purpose = "velero-backups"
++  }
++}
++
++# Velero writes immutable backup objects, but versioning protects against the
++# one case Velero cannot: someone deleting or overwriting them by hand.
++resource "aws_s3_bucket_versioning" "velero" {
++  bucket = aws_s3_bucket.velero.id
++  versioning_configuration {
++    status = "Enabled"
++  }
++}
++
++resource "aws_s3_bucket_server_side_encryption_configuration" "velero" {
++  bucket = aws_s3_bucket.velero.id
++  rule {
++    apply_server_side_encryption_by_default {
++      sse_algorithm = "AES256"
++    }
++  }
++}
++
++resource "aws_s3_bucket_public_access_block" "velero" {
++  bucket                  = aws_s3_bucket.velero.id
++  block_public_acls       = true
++  block_public_policy     = true
++  ignore_public_acls      = true
++  restrict_public_buckets = true
++}
++
++# Velero's own TTL removes the backup RECORDS; this removes the objects that
++# outlive them, including old versions. Without it the bucket only ever grows.
++resource "aws_s3_bucket_lifecycle_configuration" "velero" {
++  bucket = aws_s3_bucket.velero.id
++
++  rule {
++    id     = "expire-old-backups"
++    status = "Enabled"
++
++    filter {}
++
++    expiration {
++      days = var.velero_retention_days
++    }
++
++    noncurrent_version_expiration {
++      noncurrent_days = 7
++    }
++
++    abort_incomplete_multipart_upload {
++      days_after_initiation = 3
++    }
++  }
++}
++
++# IRSA. attach_velero_policy is a maintained policy in the upstream module -
++# EBS snapshot create/delete/describe plus scoped S3 access. Writing it by hand
++# would mean maintaining an AWS permissions list nobody reviews.
++module "velero_role" {
++  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
++  version = "~> 5.0"
++
++  role_name            = "vprofile-velero"
++  attach_velero_policy = true
++  # BUCKET arn, NOT "arn/*". The module appends /* itself for the object
++  # statement and uses the bare ARN for s3:ListBucket. Passing an
++  # already-suffixed value produces "bucket/*/*" and silently breaks writes.
++  velero_s3_bucket_arns = [aws_s3_bucket.velero.arn]
++
++  oidc_providers = {
++    main = {
++      provider_arn = module.eks.oidc_provider_arn
++      # Namespace-qualified, like every other SA identity. Changing the
++      # namespace here without changing it in the chart breaks the trust
++      # silently: Velero starts, looks healthy, and every AWS call is denied.
++      namespace_service_accounts = ["velero:velero-server"]
++    }
++  }
++}
++
++output "velero_bucket" {
++  description = "S3 bucket holding Velero backups"
++  value       = aws_s3_bucket.velero.id
++}
++
++output "velero_role_arn" {
++  description = "IAM role ARN to annotate the velero-server ServiceAccount with"
++  value       = module.velero_role.iam_role_arn
++}
+diff --git a/terraform/vpc.tf b/terraform/vpc.tf
+index f767fff..1a021af 100644
+--- a/terraform/vpc.tf
++++ b/terraform/vpc.tf
+@@ -11,7 +11,7 @@ module "vpc" {
+ 
+   enable_nat_gateway     = true
+   single_nat_gateway     = false
+-  one_nat_gateway_per_az = true  
++  one_nat_gateway_per_az = true
+ 
+   enable_dns_hostnames = true
+   enable_dns_support   = true
+@@ -19,3 +19,18 @@ module "vpc" {
+   public_subnet_tags  = { "kubernetes.io/role/elb" = 1 }
+   private_subnet_tags = { "kubernetes.io/role/internal-elb" = 1 }
+ }
++
++# --- Velero inputs -----------------------------------------------------------
++# Declared here rather than in a variables.tf that does not exist yet; move them
++# if one is ever added.
++variable "velero_bucket_name" {
++  description = "S3 bucket for Velero backups. Bucket names are GLOBALLY unique - change this if the apply fails with BucketAlreadyExists."
++  type        = string
++  default     = "vprofile-velero-backups-450444046673"
++}
++
++variable "velero_retention_days" {
++  description = "Days before S3 expires a backup object. Should exceed the Velero schedule TTL so Velero, not S3, decides what is current."
++  type        = number
++  default     = 35
++}

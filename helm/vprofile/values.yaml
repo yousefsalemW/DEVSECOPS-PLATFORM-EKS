@@ -79,6 +79,13 @@ securityContext:
     runAsUser: 11211
     runAsGroup: 11211
 
+# Velero backup hooks on db01. See the annotations in templates/10-db01.yaml
+# for why a mysqldump is used rather than FLUSH TABLES WITH READ LOCK.
+backup:
+  hooks:
+    enabled: true
+    timeout: 5m
+
 storage:
   className: gp3
   size: 8Gi

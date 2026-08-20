@@ -1,0 +1,121 @@
+# =============================================================================
+#  Velero values  —  chart 12.1.0 (Velero 1.18.1)
+#
+#  Installed by platform/bootstrap-addons.sh into the `velero` namespace.
+#  The bucket and IAM role come from terraform/velero.tf.
+#
+#  WHAT VELERO PROTECTS, AND WHAT IT DOES NOT
+#
+#    Protects well   Kubernetes objects — Deployments, Services, Secrets,
+#                    ConfigMaps, Ingress, RBAC. Namespace-level restore after
+#                    an accidental delete. Cluster rebuild.
+#
+#    Protects partly PersistentVolume data, via EBS snapshots. A snapshot of a
+#                    RUNNING MySQL volume is CRASH-consistent, not
+#                    application-consistent: pages may still sit in the InnoDB
+#                    buffer pool. It usually recovers. "Usually" is not a backup
+#                    strategy, which is why the hooks below exist.
+#
+#    Does NOT cover  The Terraform state (S3 versioning handles that), ECR
+#                    images (lifecycle policy), Jenkins configuration and job
+#                    history (unprotected — it lives on one EBS volume), and
+#                    the AWS infrastructure itself (Terraform is the recovery
+#                    mechanism, and it has never been tested end to end).
+# =============================================================================
+
+# The chart ships NO cloud provider plugin. Without this initContainer Velero
+# starts, reports healthy, and every backup fails with "unable to locate
+# provider aws". Pinned to the version this chart recommends for Velero 1.18.1.
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.13.1
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+
+# IRSA, not a static key. terraform/velero.tf trusts exactly
+# velero:velero-server, so the namespace and name below are not free choices.
+serviceAccount:
+  server:
+    create: true
+    name: velero-server
+    annotations:
+      eks.amazonaws.com/role-arn: ""   # set by bootstrap-addons.sh at runtime
+
+# useSecret: false is what switches Velero from "read a credentials file" to
+# "use the pod's IRSA identity". Leaving it true makes Velero look for a Secret
+# that does not exist and fail at startup.
+credentials:
+  useSecret: false
+
+configuration:
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: ""                       # set by bootstrap-addons.sh
+      default: true
+      config:
+        region: eu-west-3
+
+  volumeSnapshotLocation:
+    - name: default
+      provider: aws
+      config:
+        region: eu-west-3
+
+backupsEnabled: true
+snapshotsEnabled: true
+
+# The node agent (formerly restic) does file-level backup of volumes that have
+# no snapshot support. Every volume here is EBS, which snapshots natively, so
+# it would cost a DaemonSet pod per node for nothing. Turn it on the day a
+# workload uses a volume type EBS snapshots cannot cover.
+deployNodeAgent: false
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits:   { memory: 512Mi }
+
+# -----------------------------------------------------------------------------
+#  Schedules
+#
+#  TTL is what expires the backup RECORD. The S3 lifecycle rule in
+#  terraform/velero.tf expires the OBJECTS, and is deliberately set longer
+#  (35d vs 30d) so Velero stays the component that decides what is current.
+#  If S3 expired objects first, Velero would list backups that cannot restore.
+# -----------------------------------------------------------------------------
+schedules:
+  daily-vprofile:
+    disabled: false
+    schedule: "0 2 * * *"              # 02:00 UTC — after the pre-backup dump
+    useOwnerReferencesInBackup: false
+    template:
+      ttl: "720h"                      # 30 days
+      includedNamespaces:
+        - vprofile
+      snapshotVolumes: true
+      # Hooks run per pod and are declared on the pod itself (see the db01
+      # annotations in the application chart), not here.
+
+  # The platform namespaces hold no data worth snapshotting - they are
+  # rebuildable from bootstrap-addons.sh. Object-only, and kept briefly, so a
+  # namespace deleted by accident can be put back.
+  weekly-platform:
+    disabled: false
+    schedule: "0 3 * * 0"              # Sunday 03:00 UTC
+    template:
+      ttl: "336h"                      # 14 days
+      includedNamespaces:
+        - monitoring
+        - velero
+      snapshotVolumes: false
+
+# Same hardening applied to the application workloads. Velero's server runs as
+# a normal process and needs no privileges beyond its IRSA identity.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault

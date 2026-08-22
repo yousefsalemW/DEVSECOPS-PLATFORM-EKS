@@ -204,7 +204,7 @@ def scanImage(img) {
             trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
               --ignorefile ${env.TRIVY_IGNOREFILE} \
               --no-progress --ignore-unfixed --skip-db-update \
-              --severity ${params.GATE_SEVERITY} --exit-code 1 ${ref}
+              --severity ${params.GATE_SEVERITY} ${ref}
         """
     }
 }

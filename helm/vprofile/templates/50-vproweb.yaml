@@ -30,6 +30,9 @@ spec:
         app: vproweb
         {{- include "vprofile.labels" . | nindent 8 }}
     spec:
+      {{- if $.Values.serviceAccounts.enabled }}
+      serviceAccountName: vproweb
+      {{- end }}
       containers:
         - name: nginx
           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-web") }}

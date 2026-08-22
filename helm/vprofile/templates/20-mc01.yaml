@@ -27,6 +27,9 @@ spec:
         app: mc01
         {{- include "vprofile.labels" . | nindent 8 }}
     spec:
+      {{- if $.Values.serviceAccounts.enabled }}
+      serviceAccountName: mc01
+      {{- end }}
       containers:
         - name: memcached
           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-mc") }}

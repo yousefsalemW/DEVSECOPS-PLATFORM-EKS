@@ -86,6 +86,13 @@ backup:
     enabled: true
     timeout: 5m
 
+# One ServiceAccount per workload instead of everything sharing `default`.
+# Prerequisite for Vault: its Kubernetes auth maps a policy to a
+# <namespace>:<serviceaccount> pair, so without distinct identities every
+# policy would apply to every pod. See templates/05-serviceaccounts.yaml.
+serviceAccounts:
+  enabled: true
+
 storage:
   className: gp3
   size: 8Gi

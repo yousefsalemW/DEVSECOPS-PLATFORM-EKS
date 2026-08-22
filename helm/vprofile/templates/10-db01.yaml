@@ -69,6 +69,9 @@ spec:
         pre.hook.backup.velero.io/on-error: Fail
       {{- end }}
     spec:
+      {{- if $.Values.serviceAccounts.enabled }}
+      serviceAccountName: db01
+      {{- end }}
       containers:
         - name: mysql
           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-db") }}

@@ -42,6 +42,9 @@ spec:
         app: rmq01
         {{- include "vprofile.labels" . | nindent 8 }}
     spec:
+      {{- if $.Values.serviceAccounts.enabled }}
+      serviceAccountName: rmq01
+      {{- end }}
       containers:
         - name: rabbitmq
           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-rmq") }}

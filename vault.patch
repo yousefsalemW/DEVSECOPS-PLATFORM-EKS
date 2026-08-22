@@ -1,0 +1,668 @@
+diff --git a/helm/vprofile/templates/05-serviceaccounts.yaml b/helm/vprofile/templates/05-serviceaccounts.yaml
+new file mode 100644
+index 0000000..864995d
+--- /dev/null
++++ b/helm/vprofile/templates/05-serviceaccounts.yaml
+@@ -0,0 +1,31 @@
++{{- if .Values.serviceAccounts.enabled }}
++# =============================================================================
++#  Per-workload ServiceAccounts
++#
++#  WHY THIS EXISTS, and why it comes BEFORE Vault:
++#
++#  A ServiceAccount is a Kubernetes identity, and its full name is
++#  <namespace>:<name>. Vault's Kubernetes auth method works by validating the
++#  SA token a pod presents, then mapping THAT identity to a Vault policy.
++#
++#  Until now every pod in this namespace ran as the namespace `default`
++#  ServiceAccount. Vault could not have told app01 apart from vproweb, so any
++#  policy written against `default` would hand the database password to the
++#  nginx pods too - which defeats the point of using Vault at all.
++#
++#  Separately: automountServiceAccountToken is false on every workload that has
++#  no reason to talk to the Kubernetes API. A mounted token is a credential
++#  sitting inside a container that has no use for it.
++# =============================================================================
++{{- range $name := list "db01" "mc01" "rmq01" "vproweb" "app01" }}
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: {{ $name }}
++  labels: {{- include "vprofile.labels" $ | nindent 4 }}
++# app01 keeps its token: the Vault Agent Injector uses it to authenticate on
++# the pod's behalf. The other four have no such need.
++automountServiceAccountToken: {{ eq $name "app01" }}
++{{- end }}
++{{- end }}
+diff --git a/helm/vprofile/templates/10-db01.yaml b/helm/vprofile/templates/10-db01.yaml
+index a82d304..b4529bd 100644
+--- a/helm/vprofile/templates/10-db01.yaml
++++ b/helm/vprofile/templates/10-db01.yaml
+@@ -69,6 +69,9 @@ spec:
+         pre.hook.backup.velero.io/on-error: Fail
+       {{- end }}
+     spec:
++      {{- if $.Values.serviceAccounts.enabled }}
++      serviceAccountName: db01
++      {{- end }}
+       containers:
+         - name: mysql
+           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-db") }}
+diff --git a/helm/vprofile/templates/20-mc01.yaml b/helm/vprofile/templates/20-mc01.yaml
+index d6499f0..2d1052c 100644
+--- a/helm/vprofile/templates/20-mc01.yaml
++++ b/helm/vprofile/templates/20-mc01.yaml
+@@ -27,6 +27,9 @@ spec:
+         app: mc01
+         {{- include "vprofile.labels" . | nindent 8 }}
+     spec:
++      {{- if $.Values.serviceAccounts.enabled }}
++      serviceAccountName: mc01
++      {{- end }}
+       containers:
+         - name: memcached
+           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-mc") }}
+diff --git a/helm/vprofile/templates/30-rmq01.yaml b/helm/vprofile/templates/30-rmq01.yaml
+index d9ee284..d6f8dec 100644
+--- a/helm/vprofile/templates/30-rmq01.yaml
++++ b/helm/vprofile/templates/30-rmq01.yaml
+@@ -42,6 +42,9 @@ spec:
+         app: rmq01
+         {{- include "vprofile.labels" . | nindent 8 }}
+     spec:
++      {{- if $.Values.serviceAccounts.enabled }}
++      serviceAccountName: rmq01
++      {{- end }}
+       containers:
+         - name: rabbitmq
+           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-rmq") }}
+diff --git a/helm/vprofile/templates/40-app01.yaml b/helm/vprofile/templates/40-app01.yaml
+index 01e49bc..5daef5e 100644
+--- a/helm/vprofile/templates/40-app01.yaml
++++ b/helm/vprofile/templates/40-app01.yaml
+@@ -31,6 +31,9 @@ spec:
+         app: app01
+         {{- include "vprofile.labels" . | nindent 8 }}
+     spec:
++      {{- if $.Values.serviceAccounts.enabled }}
++      serviceAccountName: app01
++      {{- end }}
+       # Spring builds its Hibernate SessionFactory during context startup. If
+       # MySQL is not accepting connections yet, the context fails and Tomcat
+       # serves 404 for the life of the pod — a restart is the only cure. Waiting
+diff --git a/helm/vprofile/templates/50-vproweb.yaml b/helm/vprofile/templates/50-vproweb.yaml
+index 6051af1..b0ffa3e 100644
+--- a/helm/vprofile/templates/50-vproweb.yaml
++++ b/helm/vprofile/templates/50-vproweb.yaml
+@@ -30,6 +30,9 @@ spec:
+         app: vproweb
+         {{- include "vprofile.labels" . | nindent 8 }}
+     spec:
++      {{- if $.Values.serviceAccounts.enabled }}
++      serviceAccountName: vproweb
++      {{- end }}
+       containers:
+         - name: nginx
+           image: {{ include "vprofile.image" (dict "root" . "name" "vprofile-web") }}
+diff --git a/helm/vprofile/values.yaml b/helm/vprofile/values.yaml
+index 5910986..4e7b343 100644
+--- a/helm/vprofile/values.yaml
++++ b/helm/vprofile/values.yaml
+@@ -86,6 +86,13 @@ backup:
+     enabled: true
+     timeout: 5m
+ 
++# One ServiceAccount per workload instead of everything sharing `default`.
++# Prerequisite for Vault: its Kubernetes auth maps a policy to a
++# <namespace>:<serviceaccount> pair, so without distinct identities every
++# policy would apply to every pod. See templates/05-serviceaccounts.yaml.
++serviceAccounts:
++  enabled: true
++
+ storage:
+   className: gp3
+   size: 8Gi
+diff --git a/platform/bootstrap-addons.sh b/platform/bootstrap-addons.sh
+index 89bf053..d492e71 100644
+--- a/platform/bootstrap-addons.sh
++++ b/platform/bootstrap-addons.sh
+@@ -13,6 +13,11 @@
+ #    2. AWS Load Balancer Controller, bound to the existing IRSA role
+ #    3. kube-prometheus-stack (Prometheus, Grafana, Alertmanager, exporters)
+ #    4. Velero (backups to S3 + EBS snapshots)
++#    5. Vault (single pod, KMS auto-unseal, Agent Injector)
++#
++#  Vault is INSTALLED here but not CONFIGURED. `vault operator init` prints
++#  recovery keys and a root token exactly once; a human must capture those.
++#  Run platform/vault-configure.sh afterwards, interactively.
+ #
+ #  WHAT IT DELIBERATELY DOES NOT DO:
+ #    vpc-cni's enableNetworkPolicy is an AWS API call, not a Kubernetes one, so
+@@ -40,6 +45,8 @@ MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
+ GRAFANA_SECRET="${GRAFANA_SECRET:-grafana-admin}"
+ VELERO_CHART_VERSION="${VELERO_CHART_VERSION:-12.1.0}"
+ VELERO_NAMESPACE="${VELERO_NAMESPACE:-velero}"
++VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.34.1}"
++VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
+ 
+ log() { echo "[addons] $*"; }
+ 
+@@ -66,7 +73,7 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
+ kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
+ 
+ ###############################################################################
+-log "1/4 — gp3 StorageClass"
++log "1/5 — gp3 StorageClass"
+ ###############################################################################
+ # The EBS CSI driver addon is already installed by terraform; this only adds the
+ # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
+@@ -97,7 +104,7 @@ fi
+ kubectl get storageclass
+ 
+ ###############################################################################
+-log "2/4 — AWS Load Balancer Controller"
++log "2/5 — AWS Load Balancer Controller"
+ ###############################################################################
+ # The IRSA trust policy in terraform is scoped to exactly
+ # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
+@@ -126,7 +133,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
+   --wait --timeout 5m
+ 
+ ###############################################################################
+-log "3/4 — kube-prometheus-stack"
++log "3/5 — kube-prometheus-stack"
+ ###############################################################################
+ # Grafana's admin password is created out of band, exactly like the database and
+ # broker credentials: it never enters this script, the values file, or Git.
+@@ -177,7 +184,7 @@ kubectl -n "${MONITORING_NAMESPACE}" rollout status \
+   log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
+ 
+ ###############################################################################
+-log "4/4 — Velero"
++log "4/5 — Velero"
+ ###############################################################################
+ # The bucket and IAM role are created by terraform/velero.tf. Both are read
+ # from live AWS rather than hardcoded, for the same reason ECR_REGISTRY is
+@@ -230,6 +237,59 @@ else
+   log "  ${VELERO_NAMESPACE}:velero-server and that the SA carries the role ARN."
+ fi
+ 
++###############################################################################
++log "5/5 — Vault"
++###############################################################################
++VAULT_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/vprofile-vault"
++
++VAULT_KMS_KEY_ID="$(aws kms describe-key --region "${AWS_REGION}" \
++  --key-id alias/vprofile-vault-unseal \
++  --query 'KeyMetadata.KeyId' --output text 2>/dev/null || true)"
++
++if [ -z "${VAULT_KMS_KEY_ID}" ] || [ "${VAULT_KMS_KEY_ID}" = "None" ]; then
++  log "KMS alias 'alias/vprofile-vault-unseal' not found. Run 'terraform apply'"
++  log "first - it creates the key and the IAM role Vault unseals itself with."
++  exit 1
++fi
++log "kms key ${VAULT_KMS_KEY_ID}"
++log "role    ${VAULT_ROLE_ARN}"
++
++kubectl get namespace "${VAULT_NAMESPACE}" >/dev/null 2>&1 \
++  || kubectl create namespace "${VAULT_NAMESPACE}"
++
++helm repo add hashicorp https://helm.releases.hashicorp.com >/dev/null 2>&1 || true
++helm repo update hashicorp >/dev/null
++
++# The seal stanza needs the account-specific key id, so the values file carries
++# placeholders and they are substituted here. sed on a temp copy rather than
++# --set: the config is a raw HCL string and --set would mangle it.
++VAULT_VALUES="$(mktemp)"
++trap 'rm -f "${VAULT_VALUES}"' EXIT
++sed -e "s|AWS_REGION_PLACEHOLDER|${AWS_REGION}|" \
++    -e "s|KMS_KEY_ID_PLACEHOLDER|${VAULT_KMS_KEY_ID}|" \
++    "$(dirname "$0")/values/vault.yaml" > "${VAULT_VALUES}"
++
++# NO --wait here, unlike every other step. Vault's pod is NOT Ready until it is
++# initialised and unsealed, and it cannot be initialised until it is running.
++# Waiting for Ready would deadlock until the timeout.
++helm upgrade --install vault hashicorp/vault \
++  --namespace "${VAULT_NAMESPACE}" \
++  --version "${VAULT_CHART_VERSION}" \
++  --values "${VAULT_VALUES}" \
++  --set "server.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${VAULT_ROLE_ARN}"
++
++log "waiting for the vault-0 pod to be Running (it will NOT be Ready yet)"
++for _ in $(seq 1 30); do
++  phase="$(kubectl -n "${VAULT_NAMESPACE}" get pod vault-0 \
++    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
++  [ "${phase}" = "Running" ] && break
++  sleep 10
++done
++
++if [ "${phase:-}" != "Running" ]; then
++  log "WARNING: vault-0 is '${phase:-unknown}'. Check 'kubectl -n ${VAULT_NAMESPACE} describe pod vault-0'"
++fi
++
+ ###############################################################################
+ log "verifying"
+ ###############################################################################
+@@ -251,6 +311,17 @@ log ""
+ kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation,schedule --no-headers 2>/dev/null \
+   | awk '{print "[addons]   " $1 " " $2}'
+ 
++log ""
++kubectl -n "${VAULT_NAMESPACE}" get pods --no-headers 2>/dev/null \
++  | awk '{print "[addons]   " $1 " " $2 " " $3}'
++
++log ""
++log "VAULT IS INSTALLED BUT NOT CONFIGURED. Next, run interactively:"
++log "  kubectl -n ${VAULT_NAMESPACE} exec -it vault-0 -- vault operator init \\"
++log "    -recovery-shares=3 -recovery-threshold=2      # store the output SAFELY"
++log "  export VAULT_TOKEN='hvs....'"
++log "  bash platform/vault-configure.sh"
++
+ log ""
+ log "KNOWN GAPS, deliberately not covered here:"
+ log "  - Alertmanager has NO receivers. Alerts fire and go nowhere."
+@@ -259,5 +330,8 @@ log "      velero backup create test --include-namespaces vprofile --wait"
+ log "      velero restore create --from-backup test --namespace-mappings vprofile:vprofile-restore"
+ log "  - No log aggregation (Loki / Fluent Bit)."
+ log "  - The application exposes no JVM metrics - infrastructure only."
++log "  - Vault is a SINGLE POD. If it dies, secret delivery stops until it returns."
++log "  - Vault's own data needs 'vault operator raft snapshot save', not an EBS snapshot."
++log "  - The app still reads credentials from Kubernetes Secrets, not Vault."
+ 
+-log "done — Ingress, gp3 volumes, monitoring and backups are in place"
++log "done — Ingress, gp3 volumes, monitoring, backups and Vault are in place"
+diff --git a/platform/values/vault.yaml b/platform/values/vault.yaml
+new file mode 100644
+index 0000000..4535d1a
+--- /dev/null
++++ b/platform/values/vault.yaml
+@@ -0,0 +1,125 @@
++# =============================================================================
++#  Vault values  —  chart 0.34.1
++#
++#  Installed by platform/bootstrap-addons.sh into the `vault` namespace.
++#  The KMS key and IAM role come from terraform/vault.tf.
++#
++#  SINGLE POD, NOT HA — a deliberate choice, stated plainly.
++#
++#    An HA Vault means 3 replicas with Raft consensus. It roughly triples the
++#    memory, adds a join dance to the bootstrap, and demonstrates exactly the
++#    same concepts: Kubernetes auth, the Agent Injector, policies, and dynamic
++#    secrets. For a lab it costs a lot of setup time and teaches nothing extra.
++#
++#    What you give up is real and should be said out loud: this Vault is a
++#    single point of failure. If the pod dies, every application that fetches
++#    secrets through it cannot start until it comes back. It comes back on its
++#    own thanks to auto-unseal, but there is a gap.
++#
++#  Migration path to HA later: server.ha.enabled=true with raft, 3 replicas.
++#  The seal stanza and the auth configuration carry over unchanged.
++# =============================================================================
++
++global:
++  enabled: true
++  tlsDisable: true   # in-cluster only, reached by port-forward. See note below.
++
++# -----------------------------------------------------------------------------
++#  Agent Injector
++#
++#  This is the piece that makes Vault useful to the application without the
++#  application knowing Vault exists. It is a mutating webhook: when a pod
++#  carries the right annotations, it injects a sidecar that authenticates with
++#  the pod's ServiceAccount token, fetches the secrets that identity is allowed
++#  to read, and renders them to a shared in-memory volume.
++#
++#  Chosen over the CSI provider because the Agent also handles RENEWAL - it
++#  keeps its lease alive and re-renders when a secret changes.
++# -----------------------------------------------------------------------------
++injector:
++  enabled: true
++  replicas: 1
++  resources:
++    requests: { cpu: 50m, memory: 64Mi }
++    limits:   { memory: 128Mi }
++
++server:
++  # IRSA. terraform/vault.tf trusts exactly vault:vault, so neither the
++  # namespace nor this name is a free choice.
++  serviceAccount:
++    create: true
++    name: vault
++    annotations:
++      eks.amazonaws.com/role-arn: ""   # set by bootstrap-addons.sh at runtime
++
++  ha:
++    enabled: false
++
++  standalone:
++    enabled: true
++    # Raw HCL. The KMS key id is substituted by the bootstrap script, because it
++    # is account-specific and derived at runtime - the same reason ECR_REGISTRY
++    # and the Velero bucket are not hardcoded either.
++    config: |-
++      ui = true
++
++      listener "tcp" {
++        tls_disable     = 1
++        address         = "[::]:8200"
++        cluster_address = "[::]:8201"
++      }
++
++      # Raft rather than the chart default "file" backend: raft supports
++      # `vault operator raft snapshot`, which is the ONLY correct way to back
++      # this data up. An EBS snapshot of a live Vault volume is not a Vault
++      # backup, for the same reason it is not a MySQL backup.
++      storage "raft" {
++        path    = "/vault/data"
++        node_id = "vault-0"
++      }
++
++      # Auto-unseal. Without this the pod comes back SEALED after every restart
++      # and waits for a human to paste key shares.
++      seal "awskms" {
++        region     = "AWS_REGION_PLACEHOLDER"
++        kms_key_id = "KMS_KEY_ID_PLACEHOLDER"
++      }
++
++      service_registration "kubernetes" {}
++
++  dataStorage:
++    enabled: true
++    size: 4Gi
++    storageClass: gp3
++    accessMode: ReadWriteOnce
++
++  resources:
++    requests: { cpu: 100m, memory: 256Mi }
++    limits:   { memory: 512Mi }
++
++  # No Ingress. Reached by port-forward, like Grafana and Jenkins.
++  # An internet-facing ALB in front of a secrets manager - over plain HTTP,
++  # which is what tlsDisable means - would be indefensible.
++  ingress:
++    enabled: false
++
++  # Vault locks its memory (mlock) so secrets never reach swap. That needs
++  # IPC_LOCK, which is why this one capability survives the drop.
++  statefulSet:
++    securityContext:
++      container:
++        allowPrivilegeEscalation: false
++        capabilities:
++          drop: ["ALL"]
++          add:  ["IPC_LOCK"]
++        seccompProfile:
++          type: RuntimeDefault
++
++ui:
++  enabled: true
++  serviceType: ClusterIP   # never LoadBalancer for this
++
++# The CSI provider is the alternative to the Agent Injector. Running both is
++# two ways to do one job.
++csi:
++  enabled: false
+diff --git a/platform/vault-configure.sh b/platform/vault-configure.sh
+new file mode 100755
+index 0000000..f33138a
+--- /dev/null
++++ b/platform/vault-configure.sh
+@@ -0,0 +1,164 @@
++#!/usr/bin/env bash
++# =============================================================================
++#  Vault post-install configuration
++#
++#  DELIBERATELY SEPARATE FROM bootstrap-addons.sh, for one reason:
++#
++#  `vault operator init` prints RECOVERY KEYS and a ROOT TOKEN exactly once,
++#  and they are never retrievable again. Those must be captured by a human and
++#  stored somewhere safe - not scrolled past in CI output, not written to a
++#  Jenkins build log that lives on disk for 15 builds.
++#
++#  So the bootstrap script installs Vault and stops. This script is run by a
++#  person, interactively, and it refuses to be helpful about where the keys go.
++#
++#  WHAT IT CONFIGURES
++#    1. Kubernetes auth  - lets pods authenticate with their SA token
++#    2. A KV v2 mount    - where the application's secrets live
++#    3. A policy         - read access to exactly one path
++#    4. A role           - binds vprofile:app01 to that policy, nothing else
++#
++#  Run it from the Jenkins box, as a human, after bootstrap-addons.sh.
++# =============================================================================
++set -euo pipefail
++
++VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
++APP_NAMESPACE="${APP_NAMESPACE:-vprofile}"
++VAULT_POD="${VAULT_POD:-vault-0}"
++
++log() { printf '[vault] %s\n' "$*"; }
++vex() { kubectl -n "${VAULT_NAMESPACE}" exec -i "${VAULT_POD}" -- "$@"; }
++
++###############################################################################
++log "checking Vault status"
++###############################################################################
++# `vault status` exits 2 when sealed and 0 when unsealed - both are normal, so
++# the exit code is captured rather than allowed to trip set -e.
++status="$(vex vault status -format=json 2>/dev/null || true)"
++
++initialised="$(printf '%s' "${status}" | jq -r '.initialized // false')"
++sealed="$(printf '%s' "${status}" | jq -r '.sealed // true')"
++log "initialized=${initialised} sealed=${sealed}"
++
++if [ "${initialised}" != "true" ]; then
++  cat <<'EOF'
++
++  Vault is not initialised yet. Run this YOURSELF and store the output somewhere
++  safe before continuing - it is printed once and cannot be recovered:
++
++    kubectl -n vault exec -it vault-0 -- vault operator init \
++      -recovery-shares=3 -recovery-threshold=2
++
++  With KMS auto-unseal these are RECOVERY keys, not unseal keys: Vault unseals
++  itself on restart, and the recovery keys exist for the case where you need to
++  regenerate the root token or the KMS key becomes unusable. They still matter.
++
++  Then re-run this script.
++
++EOF
++  exit 1
++fi
++
++if [ "${sealed}" = "true" ]; then
++  log "Vault is initialised but SEALED. With awskms seal this should not happen."
++  log "Almost always the IRSA trust or the KMS policy. Check:"
++  log "  kubectl -n ${VAULT_NAMESPACE} logs ${VAULT_POD} | grep -i 'kms\\|seal\\|denied'"
++  exit 1
++fi
++
++###############################################################################
++log "authenticating"
++###############################################################################
++if [ -z "${VAULT_TOKEN:-}" ]; then
++  cat <<'EOF'
++
++  VAULT_TOKEN is not set. Export the root token from `vault operator init`:
++
++    export VAULT_TOKEN='hvs....'
++
++  Use it for this configuration and then REVOKE it - a root token that lives
++  forever is the thing Vault exists to avoid:
++
++    kubectl -n vault exec -it vault-0 -- vault token revoke -self
++
++EOF
++  exit 1
++fi
++
++vault_do() { vex env VAULT_TOKEN="${VAULT_TOKEN}" vault "$@"; }
++
++###############################################################################
++log "1/4 — Kubernetes auth method"
++###############################################################################
++# Enabling twice is an error, so tolerate "path is already in use".
++vault_do auth enable kubernetes 2>/dev/null \
++  || log "  kubernetes auth already enabled"
++
++# Vault validates SA tokens by calling the cluster's TokenReview API. Inside the
++# cluster it can discover the endpoint from its own environment, so no host,
++# CA cert or reviewer token needs to be passed - that is the modern default and
++# it avoids storing a long-lived reviewer JWT.
++vault_do write auth/kubernetes/config \
++  kubernetes_host="https://\$KUBERNETES_PORT_443_TCP_ADDR:443"
++
++###############################################################################
++log "2/4 — KV v2 secrets engine at vprofile/"
++###############################################################################
++vault_do secrets enable -path=vprofile -version=2 kv 2>/dev/null \
++  || log "  vprofile/ already mounted"
++
++###############################################################################
++log "3/4 — policy"
++###############################################################################
++# Read on ONE path. Not read on vprofile/*, not sudo, not list on everything.
++# The whole point of the ServiceAccount work was to make a policy this narrow
++# meaningful - it applies to app01 and to nothing else.
++vault_do policy write vprofile-app - <<'POLICY'
++path "vprofile/data/app01" {
++  capabilities = ["read"]
++}
++POLICY
++
++###############################################################################
++log "4/4 — role binding vprofile:app01 to that policy"
++###############################################################################
++vault_do write auth/kubernetes/role/vprofile-app \
++  bound_service_account_names=app01 \
++  bound_service_account_namespaces="${APP_NAMESPACE}" \
++  policies=vprofile-app \
++  ttl=1h
++
++cat <<EOF
++
++[vault] configured.
++
++  Write the application's secrets:
++
++    kubectl -n ${VAULT_NAMESPACE} exec -it ${VAULT_POD} -- \\
++      env VAULT_TOKEN="\$VAULT_TOKEN" vault kv put vprofile/app01 \\
++        jdbc_password='<the database password>' \\
++        rabbitmq_password='<the broker password>'
++
++  Verify the role works from the app's identity - this proves the whole chain
++  (SA token -> TokenReview -> policy) before any pod depends on it:
++
++    TOKEN=\$(kubectl -n ${APP_NAMESPACE} create token app01)
++    kubectl -n ${VAULT_NAMESPACE} exec -i ${VAULT_POD} -- \\
++      vault write auth/kubernetes/login role=vprofile-app jwt="\$TOKEN"
++
++  Then REVOKE the root token:
++
++    kubectl -n ${VAULT_NAMESPACE} exec -it ${VAULT_POD} -- \\
++      env VAULT_TOKEN="\$VAULT_TOKEN" vault token revoke -self
++
++  NOT DONE YET, and deliberately so:
++    - The application still reads its credentials from Kubernetes Secrets.
++      Switching it to Vault needs the injector annotations on app01 AND a
++      change to how the app reads them - Spring resolves placeholders at
++      STARTUP, so a rotated secret needs a pod restart either way.
++    - Vault's own data has no backup. Use 'vault operator raft snapshot save',
++      not an EBS snapshot - see the note in platform/values/vault.yaml.
++    - Static secrets only. Dynamic database credentials are where Vault earns
++      its keep, and that is a separate piece of work.
++
++EOF
+diff --git a/terraform/vault.tf b/terraform/vault.tf
+new file mode 100644
+index 0000000..295ba9d
+--- /dev/null
++++ b/terraform/vault.tf
+@@ -0,0 +1,87 @@
++# =============================================================================
++#  Vault — KMS auto-unseal key and IRSA identity
++#
++#  WHY AUTO-UNSEAL MATTERS MORE THAN IT SOUNDS
++#
++#  Vault starts SEALED. Its storage is encrypted with a master key that Vault
++#  itself cannot read until it is unsealed. Without auto-unseal, a human must
++#  paste unseal key shares EVERY time the pod restarts - after a node drain, an
++#  OOM kill, a chart upgrade, a spot reclamation. That is not operable: it means
++#  Vault is down until someone is awake, and every application that depends on
++#  it is down too.
++#
++#  With awskms seal, Vault asks KMS to decrypt its master key at startup using
++#  the pod's IRSA identity. No human, no stored key shares.
++#
++#  The trade-off, stated plainly: the KMS key becomes a dependency of Vault
++#  starting AT ALL. Delete it and the data is unrecoverable - which is why
++#  deletion_window_in_days is set to the maximum and rotation is enabled rather
++#  than the key being replaced.
++# =============================================================================
++
++resource "aws_kms_key" "vault_unseal" {
++  description             = "Vault auto-unseal (vprofile)"
++  enable_key_rotation     = true
++  deletion_window_in_days = 30
++
++  tags = {
++    Name    = "vprofile-vault-unseal"
++    Purpose = "vault-auto-unseal"
++  }
++}
++
++resource "aws_kms_alias" "vault_unseal" {
++  name          = "alias/vprofile-vault-unseal"
++  target_key_id = aws_kms_key.vault_unseal.key_id
++}
++
++# The upstream IAM module has no built-in Vault policy, so this is written by
++# hand - deliberately narrow: three actions on ONE key.
++data "aws_iam_policy_document" "vault_unseal" {
++  statement {
++    sid = "VaultAutoUnseal"
++    actions = [
++      "kms:Encrypt",
++      "kms:Decrypt",
++      "kms:DescribeKey",
++    ]
++    resources = [aws_kms_key.vault_unseal.arn]
++  }
++}
++
++resource "aws_iam_policy" "vault_unseal" {
++  name        = "vprofile-vault-unseal"
++  description = "Allows Vault to auto-unseal with its KMS key"
++  policy      = data.aws_iam_policy_document.vault_unseal.json
++}
++
++module "vault_role" {
++  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
++  version = "~> 5.0"
++
++  role_name = "vprofile-vault"
++
++  role_policy_arns = {
++    unseal = aws_iam_policy.vault_unseal.arn
++  }
++
++  oidc_providers = {
++    main = {
++      provider_arn = module.eks.oidc_provider_arn
++      # Namespace-qualified, like every other SA identity here. If this and the
++      # chart's serviceAccount name ever disagree, Vault starts, reports
++      # healthy, and stays SEALED with an AccessDenied in its logs.
++      namespace_service_accounts = ["vault:vault"]
++    }
++  }
++}
++
++output "vault_kms_key_id" {
++  description = "KMS key id for the Vault awskms seal stanza"
++  value       = aws_kms_key.vault_unseal.key_id
++}
++
++output "vault_role_arn" {
++  description = "IAM role ARN to annotate the vault ServiceAccount with"
++  value       = module.vault_role.iam_role_arn
++}

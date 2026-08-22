@@ -13,6 +13,11 @@
 #    2. AWS Load Balancer Controller, bound to the existing IRSA role
 #    3. kube-prometheus-stack (Prometheus, Grafana, Alertmanager, exporters)
 #    4. Velero (backups to S3 + EBS snapshots)
+#    5. Vault (single pod, KMS auto-unseal, Agent Injector)
+#
+#  Vault is INSTALLED here but not CONFIGURED. `vault operator init` prints
+#  recovery keys and a root token exactly once; a human must capture those.
+#  Run platform/vault-configure.sh afterwards, interactively.
 #
 #  WHAT IT DELIBERATELY DOES NOT DO:
 #    vpc-cni's enableNetworkPolicy is an AWS API call, not a Kubernetes one, so
@@ -40,6 +45,8 @@ MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
 GRAFANA_SECRET="${GRAFANA_SECRET:-grafana-admin}"
 VELERO_CHART_VERSION="${VELERO_CHART_VERSION:-12.1.0}"
 VELERO_NAMESPACE="${VELERO_NAMESPACE:-velero}"
+VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.34.1}"
+VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
 
 log() { echo "[addons] $*"; }
 
@@ -66,7 +73,7 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
 kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
 
 ###############################################################################
-log "1/4 — gp3 StorageClass"
+log "1/5 — gp3 StorageClass"
 ###############################################################################
 # The EBS CSI driver addon is already installed by terraform; this only adds the
 # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
@@ -97,7 +104,7 @@ fi
 kubectl get storageclass
 
 ###############################################################################
-log "2/4 — AWS Load Balancer Controller"
+log "2/5 — AWS Load Balancer Controller"
 ###############################################################################
 # The IRSA trust policy in terraform is scoped to exactly
 # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
@@ -126,7 +133,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --wait --timeout 5m
 
 ###############################################################################
-log "3/4 — kube-prometheus-stack"
+log "3/5 — kube-prometheus-stack"
 ###############################################################################
 # Grafana's admin password is created out of band, exactly like the database and
 # broker credentials: it never enters this script, the values file, or Git.
@@ -177,7 +184,7 @@ kubectl -n "${MONITORING_NAMESPACE}" rollout status \
   log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
 
 ###############################################################################
-log "4/4 — Velero"
+log "4/5 — Velero"
 ###############################################################################
 # The bucket and IAM role are created by terraform/velero.tf. Both are read
 # from live AWS rather than hardcoded, for the same reason ECR_REGISTRY is
@@ -231,6 +238,59 @@ else
 fi
 
 ###############################################################################
+log "5/5 — Vault"
+###############################################################################
+VAULT_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/vprofile-vault"
+
+VAULT_KMS_KEY_ID="$(aws kms describe-key --region "${AWS_REGION}" \
+  --key-id alias/vprofile-vault-unseal \
+  --query 'KeyMetadata.KeyId' --output text 2>/dev/null || true)"
+
+if [ -z "${VAULT_KMS_KEY_ID}" ] || [ "${VAULT_KMS_KEY_ID}" = "None" ]; then
+  log "KMS alias 'alias/vprofile-vault-unseal' not found. Run 'terraform apply'"
+  log "first - it creates the key and the IAM role Vault unseals itself with."
+  exit 1
+fi
+log "kms key ${VAULT_KMS_KEY_ID}"
+log "role    ${VAULT_ROLE_ARN}"
+
+kubectl get namespace "${VAULT_NAMESPACE}" >/dev/null 2>&1 \
+  || kubectl create namespace "${VAULT_NAMESPACE}"
+
+helm repo add hashicorp https://helm.releases.hashicorp.com >/dev/null 2>&1 || true
+helm repo update hashicorp >/dev/null
+
+# The seal stanza needs the account-specific key id, so the values file carries
+# placeholders and they are substituted here. sed on a temp copy rather than
+# --set: the config is a raw HCL string and --set would mangle it.
+VAULT_VALUES="$(mktemp)"
+trap 'rm -f "${VAULT_VALUES}"' EXIT
+sed -e "s|AWS_REGION_PLACEHOLDER|${AWS_REGION}|" \
+    -e "s|KMS_KEY_ID_PLACEHOLDER|${VAULT_KMS_KEY_ID}|" \
+    "$(dirname "$0")/values/vault.yaml" > "${VAULT_VALUES}"
+
+# NO --wait here, unlike every other step. Vault's pod is NOT Ready until it is
+# initialised and unsealed, and it cannot be initialised until it is running.
+# Waiting for Ready would deadlock until the timeout.
+helm upgrade --install vault hashicorp/vault \
+  --namespace "${VAULT_NAMESPACE}" \
+  --version "${VAULT_CHART_VERSION}" \
+  --values "${VAULT_VALUES}" \
+  --set "server.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${VAULT_ROLE_ARN}"
+
+log "waiting for the vault-0 pod to be Running (it will NOT be Ready yet)"
+for _ in $(seq 1 30); do
+  phase="$(kubectl -n "${VAULT_NAMESPACE}" get pod vault-0 \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [ "${phase}" = "Running" ] && break
+  sleep 10
+done
+
+if [ "${phase:-}" != "Running" ]; then
+  log "WARNING: vault-0 is '${phase:-unknown}'. Check 'kubectl -n ${VAULT_NAMESPACE} describe pod vault-0'"
+fi
+
+###############################################################################
 log "verifying"
 ###############################################################################
 kubectl -n kube-system rollout status deploy/aws-load-balancer-controller --timeout=3m
@@ -252,6 +312,17 @@ kubectl -n "${VELERO_NAMESPACE}" get backupstoragelocation,schedule --no-headers
   | awk '{print "[addons]   " $1 " " $2}'
 
 log ""
+kubectl -n "${VAULT_NAMESPACE}" get pods --no-headers 2>/dev/null \
+  | awk '{print "[addons]   " $1 " " $2 " " $3}'
+
+log ""
+log "VAULT IS INSTALLED BUT NOT CONFIGURED. Next, run interactively:"
+log "  kubectl -n ${VAULT_NAMESPACE} exec -it vault-0 -- vault operator init \\"
+log "    -recovery-shares=3 -recovery-threshold=2      # store the output SAFELY"
+log "  export VAULT_TOKEN='hvs....'"
+log "  bash platform/vault-configure.sh"
+
+log ""
 log "KNOWN GAPS, deliberately not covered here:"
 log "  - Alertmanager has NO receivers. Alerts fire and go nowhere."
 log "  - RESTORE HAS NEVER BEEN TESTED. An untested backup is a hypothesis."
@@ -259,5 +330,8 @@ log "      velero backup create test --include-namespaces vprofile --wait"
 log "      velero restore create --from-backup test --namespace-mappings vprofile:vprofile-restore"
 log "  - No log aggregation (Loki / Fluent Bit)."
 log "  - The application exposes no JVM metrics - infrastructure only."
+log "  - Vault is a SINGLE POD. If it dies, secret delivery stops until it returns."
+log "  - Vault's own data needs 'vault operator raft snapshot save', not an EBS snapshot."
+log "  - The app still reads credentials from Kubernetes Secrets, not Vault."
 
-log "done — Ingress, gp3 volumes, monitoring and backups are in place"
+log "done — Ingress, gp3 volumes, monitoring, backups and Vault are in place"

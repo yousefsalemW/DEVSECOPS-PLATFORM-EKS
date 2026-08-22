@@ -31,6 +31,9 @@ spec:
         app: app01
         {{- include "vprofile.labels" . | nindent 8 }}
     spec:
+      {{- if $.Values.serviceAccounts.enabled }}
+      serviceAccountName: app01
+      {{- end }}
       # Spring builds its Hibernate SessionFactory during context startup. If
       # MySQL is not accepting connections yet, the context fails and Tomcat
       # serves 404 for the life of the pod — a restart is the only cure. Waiting

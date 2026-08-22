@@ -1,0 +1,125 @@
+# =============================================================================
+#  Vault values  —  chart 0.34.1
+#
+#  Installed by platform/bootstrap-addons.sh into the `vault` namespace.
+#  The KMS key and IAM role come from terraform/vault.tf.
+#
+#  SINGLE POD, NOT HA — a deliberate choice, stated plainly.
+#
+#    An HA Vault means 3 replicas with Raft consensus. It roughly triples the
+#    memory, adds a join dance to the bootstrap, and demonstrates exactly the
+#    same concepts: Kubernetes auth, the Agent Injector, policies, and dynamic
+#    secrets. For a lab it costs a lot of setup time and teaches nothing extra.
+#
+#    What you give up is real and should be said out loud: this Vault is a
+#    single point of failure. If the pod dies, every application that fetches
+#    secrets through it cannot start until it comes back. It comes back on its
+#    own thanks to auto-unseal, but there is a gap.
+#
+#  Migration path to HA later: server.ha.enabled=true with raft, 3 replicas.
+#  The seal stanza and the auth configuration carry over unchanged.
+# =============================================================================
+
+global:
+  enabled: true
+  tlsDisable: true   # in-cluster only, reached by port-forward. See note below.
+
+# -----------------------------------------------------------------------------
+#  Agent Injector
+#
+#  This is the piece that makes Vault useful to the application without the
+#  application knowing Vault exists. It is a mutating webhook: when a pod
+#  carries the right annotations, it injects a sidecar that authenticates with
+#  the pod's ServiceAccount token, fetches the secrets that identity is allowed
+#  to read, and renders them to a shared in-memory volume.
+#
+#  Chosen over the CSI provider because the Agent also handles RENEWAL - it
+#  keeps its lease alive and re-renders when a secret changes.
+# -----------------------------------------------------------------------------
+injector:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { memory: 128Mi }
+
+server:
+  # IRSA. terraform/vault.tf trusts exactly vault:vault, so neither the
+  # namespace nor this name is a free choice.
+  serviceAccount:
+    create: true
+    name: vault
+    annotations:
+      eks.amazonaws.com/role-arn: ""   # set by bootstrap-addons.sh at runtime
+
+  ha:
+    enabled: false
+
+  standalone:
+    enabled: true
+    # Raw HCL. The KMS key id is substituted by the bootstrap script, because it
+    # is account-specific and derived at runtime - the same reason ECR_REGISTRY
+    # and the Velero bucket are not hardcoded either.
+    config: |-
+      ui = true
+
+      listener "tcp" {
+        tls_disable     = 1
+        address         = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+
+      # Raft rather than the chart default "file" backend: raft supports
+      # `vault operator raft snapshot`, which is the ONLY correct way to back
+      # this data up. An EBS snapshot of a live Vault volume is not a Vault
+      # backup, for the same reason it is not a MySQL backup.
+      storage "raft" {
+        path    = "/vault/data"
+        node_id = "vault-0"
+      }
+
+      # Auto-unseal. Without this the pod comes back SEALED after every restart
+      # and waits for a human to paste key shares.
+      seal "awskms" {
+        region     = "AWS_REGION_PLACEHOLDER"
+        kms_key_id = "KMS_KEY_ID_PLACEHOLDER"
+      }
+
+      service_registration "kubernetes" {}
+
+  dataStorage:
+    enabled: true
+    size: 4Gi
+    storageClass: gp3
+    accessMode: ReadWriteOnce
+
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }
+
+  # No Ingress. Reached by port-forward, like Grafana and Jenkins.
+  # An internet-facing ALB in front of a secrets manager - over plain HTTP,
+  # which is what tlsDisable means - would be indefensible.
+  ingress:
+    enabled: false
+
+  # Vault locks its memory (mlock) so secrets never reach swap. That needs
+  # IPC_LOCK, which is why this one capability survives the drop.
+  statefulSet:
+    securityContext:
+      container:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+          add:  ["IPC_LOCK"]
+        seccompProfile:
+          type: RuntimeDefault
+
+ui:
+  enabled: true
+  serviceType: ClusterIP   # never LoadBalancer for this
+
+# The CSI provider is the alternative to the Agent Injector. Running both is
+# two ways to do one job.
+csi:
+  enabled: false

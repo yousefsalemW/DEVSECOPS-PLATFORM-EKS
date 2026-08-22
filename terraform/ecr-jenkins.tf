@@ -13,9 +13,9 @@ resource "aws_ecr_repository" "repos" {
 
   name                 = each.value
   image_tag_mutability = "IMMUTABLE"
-  force_delete = true
-# Allow full Terraform teardown by deleting images before the ECR repository.
-# This is intentional because the ECR repositories are fully managed by Terraform.
+  force_delete         = true
+  # Allow full Terraform teardown by deleting images before the ECR repository.
+  # This is intentional because the ECR repositories are fully managed by Terraform.
 
   image_scanning_configuration {
     scan_on_push = true
@@ -124,6 +124,21 @@ resource "aws_iam_role_policy" "jenkins_eks" {
         ]
 
         Resource = "*"
+      },
+
+      # The ONLY additional power the standing Jenkins identity gains: the
+      # ability to ASK for the platform role. It cannot install anything itself
+      # - its EKS access is still AmazonEKSEditPolicy on the vprofile namespace
+      # (see eks.tf). Everything the platform pipeline does happens inside an
+      # assumed session, which CloudTrail records separately.
+      {
+        Effect = "Allow"
+
+        Action = [
+          "sts:AssumeRole"
+        ]
+
+        Resource = aws_iam_role.jenkins_platform.arn
       }
     ]
   })
@@ -159,7 +174,7 @@ resource "aws_vpc_security_group_egress_rule" "jenkins_all" {
 
   security_group_id = aws_security_group.jenkins.id
 
-  cidr_ipv4   = "0.0.0.0/0"
+  cidr_ipv4 = "0.0.0.0/0"
 
   ip_protocol = "-1"
 
@@ -173,7 +188,7 @@ resource "aws_vpc_security_group_egress_rule" "jenkins_all" {
 
 resource "aws_instance" "jenkins" {
 
-  ami           = "ami-015cabafc8f6249fe"
+  ami = "ami-015cabafc8f6249fe"
 
   instance_type = "m7i-flex.large"
 

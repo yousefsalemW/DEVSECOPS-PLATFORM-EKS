@@ -1,0 +1,234 @@
+// =============================================================================
+//  Jenkinsfile-platform  —  cluster add-ons
+//
+//  SEPARATE FROM Jenkinsfile ON PURPOSE. The two differ in every operational
+//  dimension that matters:
+//
+//                     application pipeline        platform pipeline
+//    runs             every push                  once per cluster, and on
+//                                                 a deliberate chart bump
+//    changes          one container image         the substrate the app runs on
+//    on failure       one build                   a half-built cluster
+//    identity         EKSEditPolicy on vprofile   assumed cluster-admin
+//    trigger          webhook                     a human, with an approval step
+//
+//  The fourth row is why this file exists. jenkins-ec2-role is scoped to the
+//  vprofile namespace. Merging platform installs into the application pipeline
+//  would mean widening that role permanently, for every build.
+//
+//  THIS PIPELINE DELIBERATELY HAS NO COMPONENT SELECTION.
+//
+//  There is no ALL / storageclass / monitoring / velero parameter, and that is
+//  a design decision rather than an omission. bootstrap-addons.sh executes five
+//  steps in a fixed order with real prerequisites between them:
+//
+//    1. gp3 StorageClass   <- monitoring, velero and vault ALL provision PVCs
+//                             against it. Skip it and their volumes sit Pending
+//                             forever with no obvious cause.
+//    2. LB Controller      <- without it an Ingress is ACCEPTED and no ALB is
+//                             ever created. Silent.
+//    3. monitoring   4. velero   5. vault
+//
+//  The script enforces that order by being a script: `set -euo pipefail` means
+//  step 4 cannot run if step 2 failed. Exposing a component picker in Jenkins
+//  would split that logic across two files and let a user reach step 4 without
+//  step 1 - producing a "successful" build and a broken cluster.
+//
+//  So Jenkins is the TRIGGER and the AUDIT TRAIL. The script stays the single
+//  source of truth for what gets installed and in what order.
+// =============================================================================
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    // No triggers block. This pipeline is never started by a webhook or a
+    // schedule - platform changes are deliberate acts.
+
+    parameters {
+        choice(name: 'ACTION', choices: ['verify', 'deploy'],
+               description: 'verify = read-only check of what is installed, changes nothing. deploy = run bootstrap-addons.sh. VERIFY IS THE DEFAULT so an accidental "Build with Parameters" cannot alter the cluster')
+        string(name: 'AWS_REGION', defaultValue: 'eu-west-3',
+               description: 'Region the cluster lives in')
+        string(name: 'CLUSTER_NAME', defaultValue: 'vprofile-eks',
+               description: 'EKS cluster to operate on')
+        string(name: 'PLATFORM_ROLE_NAME', defaultValue: 'jenkins-platform-role',
+               description: 'Role this pipeline assumes. Created by terraform/jenkins-platform-role.tf - the ARN is a terraform output')
+        booleanParam(name: 'REQUIRE_APPROVAL', defaultValue: true,
+               description: 'Pause for a human before making any change. Turn off only for an unattended rebuild you are watching')
+    }
+
+    environment {
+        AWS_REGION = "${params.AWS_REGION}"
+        // Build-scoped, exactly as in the application pipeline: this must not
+        // depend on, or disturb, whatever an operator has in ~/.kube/config.
+        KUBECONFIG = "${WORKSPACE}/.kube/platform-config"
+    }
+
+    stages {
+
+        // ---------- 1. Assume the platform role ------------------------------
+        // Everything after this runs as jenkins-platform-role. The EC2 role's
+        // own EKS access (EditPolicy on vprofile) is never used here.
+        stage('Assume Platform Role') {
+            steps {
+                script {
+                    env.ACCOUNT_ID = sh(returnStdout: true,
+                        script: 'aws sts get-caller-identity --query Account --output text').trim()
+                    env.PLATFORM_ROLE_ARN = "arn:aws:iam::${env.ACCOUNT_ID}:role/${params.PLATFORM_ROLE_NAME}"
+
+                    def base = sh(returnStdout: true,
+                        script: 'aws sts get-caller-identity --query Arn --output text').trim()
+                    echo "base identity : ${base}"
+                    echo "assuming      : ${env.PLATFORM_ROLE_ARN}"
+
+                    // The session name lands in CloudTrail, so "who installed
+                    // this, and from which build" has an answer months later.
+                    def creds = sh(returnStdout: true, script: """
+                        aws sts assume-role \
+                          --role-arn ${env.PLATFORM_ROLE_ARN} \
+                          --role-session-name jenkins-platform-${env.BUILD_NUMBER} \
+                          --duration-seconds 3600 \
+                          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+                          --output text
+                    """).trim().split(/\s+/)
+
+                    if (creds.size() != 3) {
+                        error("""AssumeRole did not return credentials.
+Check that terraform has been applied and that ${params.PLATFORM_ROLE_NAME} trusts jenkins-ec2-role:
+  aws iam get-role --role-name ${params.PLATFORM_ROLE_NAME} --query 'Role.AssumeRolePolicyDocument'""")
+                    }
+
+                    // Held in env for the rest of the build. Jenkins masks
+                    // nothing here automatically, so these are never echoed -
+                    // the verification below prints the resulting ARN instead.
+                    env.AWS_ACCESS_KEY_ID     = creds[0]
+                    env.AWS_SECRET_ACCESS_KEY = creds[1]
+                    env.AWS_SESSION_TOKEN     = creds[2]
+
+                    def who = sh(returnStdout: true,
+                        script: 'aws sts get-caller-identity --query Arn --output text').trim()
+                    echo "now acting as : ${who}"
+
+                    if (!who.contains('jenkins-platform')) {
+                        error("Expected to be acting as the platform role, got: ${who}")
+                    }
+                }
+            }
+        }
+
+        // ---------- 2. Connect ------------------------------------------------
+        stage('Connect') {
+            steps {
+                sh '''
+                    mkdir -p "$(dirname "${KUBECONFIG}")"
+                    aws eks update-kubeconfig \
+                      --name "''' + "${params.CLUSTER_NAME}" + '''" \
+                      --region "${AWS_REGION}" \
+                      --kubeconfig "${KUBECONFIG}"
+
+                    kubectl version --request-timeout=20s -o json > /dev/null
+                    kubectl get nodes --no-headers | awk '{print "  node " $1 " " $2}'
+                '''
+            }
+        }
+
+        // ---------- 3. Report current state -----------------------------------
+        // Runs for BOTH actions. For verify it is the whole job; for deploy it
+        // is the before-picture, which is what makes the build log useful when
+        // something changed and nobody remembers what it looked like before.
+        stage('Report') {
+            steps {
+                sh '''
+                    echo "--- helm releases ---"
+                    for ns in kube-system monitoring velero vault; do
+                      helm -n "$ns" list --short 2>/dev/null \
+                        | awk -v n="$ns" '{print "  " n "/" $1}'
+                    done
+
+                    echo "--- storage classes ---"
+                    kubectl get storageclass --no-headers 2>/dev/null \
+                      | awk '{print "  " $1 " " $2}'
+
+                    echo "--- platform namespaces ---"
+                    for ns in monitoring velero vault; do
+                      if kubectl get namespace "$ns" >/dev/null 2>&1; then
+                        ready=$(kubectl -n "$ns" get pods --no-headers 2>/dev/null \
+                          | grep -c "Running" || true)
+                        total=$(kubectl -n "$ns" get pods --no-headers 2>/dev/null | wc -l)
+                        echo "  $ns: $ready/$total pods running"
+                      else
+                        echo "  $ns: not present"
+                      fi
+                    done
+                '''
+            }
+        }
+
+        // ---------- 4. Approval -----------------------------------------------
+        stage('Approval') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'deploy' }
+                    expression { params.REQUIRE_APPROVAL }
+                }
+            }
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input message: "Run bootstrap-addons.sh against ${params.CLUSTER_NAME}? This installs cluster-scoped resources.",
+                          ok: 'Deploy platform'
+                }
+            }
+        }
+
+        // ---------- 5. Deploy --------------------------------------------------
+        // One line of real work. All ordering, prerequisites and version pinning
+        // live in the script - Jenkins deliberately knows none of it.
+        stage('Deploy') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh 'bash platform/bootstrap-addons.sh'
+            }
+        }
+    }
+
+    post {
+        always {
+            // The assumed credentials are short-lived anyway, but leaving them
+            // in the environment of a finished build is pointless risk.
+            script {
+                env.AWS_ACCESS_KEY_ID     = ''
+                env.AWS_SECRET_ACCESS_KEY = ''
+                env.AWS_SESSION_TOKEN     = ''
+            }
+            sh 'rm -rf "${WORKSPACE}/.kube" || true'
+        }
+        success {
+            script {
+                if (params.ACTION == 'deploy') {
+                    echo '''
+Platform deployed.
+
+VAULT IS INSTALLED BUT NOT CONFIGURED, and cannot be from here:
+`vault operator init` prints recovery keys and a root token exactly once. In a
+Jenkins log they would sit on disk for 20 builds. Run this yourself:
+
+  kubectl -n vault exec -it vault-0 -- vault operator init \\
+    -recovery-shares=3 -recovery-threshold=2
+  export VAULT_TOKEN='hvs....'
+  bash platform/vault-configure.sh
+'''
+                }
+            }
+        }
+        failure {
+            echo 'Platform run failed. The cluster may be partially configured - re-run with ACTION=verify to see current state before deciding.'
+        }
+    }
+}

@@ -1,0 +1,55 @@
+diff --git a/Jenkinsfile b/Jenkinsfile
+index ce00bff..c550969 100644
+--- a/Jenkinsfile
++++ b/Jenkinsfile
+@@ -252,9 +252,31 @@ def preflight() {
+           --kubeconfig "\${KUBECONFIG}"
+ 
+         kubectl version --request-timeout=20s -o json > /dev/null
+-        kubectl get nodes --no-headers | awk '{print "  node " \$1 " " \$2}'
+     """
+ 
++    // Deliberately NOT `kubectl get nodes`. This pipeline runs as
++    // jenkins-ec2-role, whose EKS access is AmazonEKSEditPolicy scoped to a
++    // single namespace - nodes are cluster-scoped and are not in it.
++    //
++    // The old line was worse than a plain failure: `kubectl ... | awk` makes the
++    // shell report awk's exit status, not kubectl's, so a Forbidden printed in
++    // red and the build carried on regardless. Anything that must actually gate
++    // the build has to be checked with returnStatus, never through a pipe.
++    def unreachable = sh(returnStatus: true, script: """
++        kubectl -n ${params.K8S_NAMESPACE} get pods --request-timeout=20s > /dev/null 2>&1
++    """)
++    if (unreachable != 0) {
++        error("""Cannot list pods in namespace '${params.K8S_NAMESPACE}'.
++
++Either the namespace does not exist, or this role cannot see it. The namespace
++is created by the PLATFORM pipeline, not this one - it is a cluster-scoped
++write, and jenkins-ec2-role deliberately cannot perform it.
++
++Run the platform pipeline once (MODE=deploy) against a fresh cluster, or do it
++by hand after assuming the platform role:
++  kubectl create namespace ${params.K8S_NAMESPACE}""")
++    }
++
+     // Both credentials are required by the chart (db.existingSecret and
+     // rabbitmq.existingSecret). Checked here rather than left to helm, because
+     // a missing Secret otherwise surfaces a minute into the render as a template
+@@ -294,10 +316,16 @@ def renderManifests() {
+ // deploy: on failure it rolls back and deletes the very pods you need to
+ // inspect. Now that the deployment is known-good, automatic rollback is what we
+ // want -- a failed pipeline must never leave a half-updated release running.
++//
++// NO --create-namespace: that flag makes helm read the Namespace object before
++// deciding whether to create it, and reading a Namespace is a cluster-scoped
++// GET that jenkins-ec2-role cannot perform. It can therefore fail with
++// Forbidden even when the namespace already exists. The namespace belongs to
++// the platform layer; preflight() above fails with a clear message if missing.
+ def deployRelease() {
+     sh """
+         helm upgrade --install ${params.HELM_RELEASE} helm/vprofile \
+-          --namespace ${params.K8S_NAMESPACE} --create-namespace \
++          --namespace ${params.K8S_NAMESPACE} \
+           --set image.registry=${env.ECR_REGISTRY} \
+           --set image.tag=${env.TAG} \
+           --set db.existingSecret=${params.DB_SECRET_NAME} \

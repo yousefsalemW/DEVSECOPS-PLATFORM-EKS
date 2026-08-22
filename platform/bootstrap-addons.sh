@@ -47,6 +47,7 @@ VELERO_CHART_VERSION="${VELERO_CHART_VERSION:-12.1.0}"
 VELERO_NAMESPACE="${VELERO_NAMESPACE:-velero}"
 VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.34.1}"
 VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
+APP_NAMESPACE="${APP_NAMESPACE:-vprofile}"
 
 log() { echo "[addons] $*"; }
 
@@ -73,7 +74,17 @@ kubectl version --request-timeout=15s -o json >/dev/null 2>&1 || {
 kubectl get nodes --no-headers | awk '{print "[addons]   node " $1 " " $2}'
 
 ###############################################################################
-log "1/5 — gp3 StorageClass"
+log "1/6 — application namespace"
+###############################################################################
+# Namespaces are cluster-scoped, so the application pipeline cannot create this
+# one under its namespace-scoped Edit policy. Platform owns it; the app pipeline
+# only ever deploys INTO it. This must also exist before the two credential
+# Secrets can be created.
+kubectl create namespace "${APP_NAMESPACE}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+###############################################################################
+log "2/6 — gp3 StorageClass"
 ###############################################################################
 # The EBS CSI driver addon is already installed by terraform; this only adds the
 # class that uses it. gp3 is cheaper and faster than gp2 at the same size, and
@@ -104,7 +115,7 @@ fi
 kubectl get storageclass
 
 ###############################################################################
-log "2/5 — AWS Load Balancer Controller"
+log "3/6 — AWS Load Balancer Controller"
 ###############################################################################
 # The IRSA trust policy in terraform is scoped to exactly
 # system:serviceaccount:kube-system:aws-load-balancer-controller — so the
@@ -133,7 +144,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --wait --timeout 5m
 
 ###############################################################################
-log "3/5 — kube-prometheus-stack"
+log "4/6 — kube-prometheus-stack"
 ###############################################################################
 # Grafana's admin password is created out of band, exactly like the database and
 # broker credentials: it never enters this script, the values file, or Git.
@@ -184,7 +195,7 @@ kubectl -n "${MONITORING_NAMESPACE}" rollout status \
   log "WARNING: Prometheus did not become ready - check 'kubectl -n ${MONITORING_NAMESPACE} describe pod'"
 
 ###############################################################################
-log "4/5 — Velero"
+log "5/6 — Velero"
 ###############################################################################
 # The bucket and IAM role are created by terraform/velero.tf. Both are read
 # from live AWS rather than hardcoded, for the same reason ECR_REGISTRY is
@@ -238,7 +249,7 @@ else
 fi
 
 ###############################################################################
-log "5/5 — Vault"
+log "6/6 — Vault"
 ###############################################################################
 VAULT_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/vprofile-vault"
 

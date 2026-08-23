@@ -143,8 +143,8 @@ grafana:
     size: 2Gi
 
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits:   { memory: 256Mi }
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
 
   # Pre-load the standard Kubernetes dashboard set. Without this Grafana starts
   # empty and every dashboard is a manual import.

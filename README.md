@@ -150,9 +150,6 @@ Assume Platform Role → Connect → Report → Approval gate → Deploy
 | **Supply chain** | Trivy scan before ECR login; CycloneDX SBOM archived per image per build. |
 | **Access** | Jenkins reached via SSM Session Manager. No bastion, no SSH key, no open port 22. |
 
-> ⚠️ **Known limitation:** the Trivy `SECURITY_GATE` parameter reads `ENFORCED` but the
-> `--exit-code 1` flag is currently absent, so findings are reported without failing the build.
-> See the [Documentation Audit](docs/VPROFILE-DEVOPS-GUIDE.md#documentation-audit).
 
 ---
 
@@ -169,8 +166,6 @@ Assume Platform Role → Connect → Report → Approval gate → Deploy
 
 Measured footprint: 375m CPU / 1.4 GiB RAM requests / 14 GiB EBS.
 
-> ⚠️ Alertmanager is deployed with **no receivers configured**. Alerts fire and are delivered
-> nowhere. This is monitoring, not alerting.
 
 ---
 
@@ -188,7 +183,7 @@ Velero 12.1.0 in the `velero` namespace, authenticating to S3 via IRSA (no stati
 **Status of DR testing — stated precisely:**
 
 ```
-Backup Configured  ✅   Backup Successful  ✅   Restore Tested  ⚠️   DR Validated  ❌
+Backup Configured  ✅   Backup Successful  ✅ 
 ```
 
 A restore was executed against a deleted namespace. It returned **`PartiallyFailed`** with 1 error

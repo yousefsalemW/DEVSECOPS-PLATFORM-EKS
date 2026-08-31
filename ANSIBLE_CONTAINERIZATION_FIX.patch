@@ -1,0 +1,368 @@
+diff --git a/.gitignore b/.gitignore
+index ead0f5c..06179d0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,10 +1,18 @@
+-# ملفات Docker المؤقتة
+-*.tar
++# Real inventories - never commit host addresses or SSH users
++inventory.ini
++inventory
++inventory.yml
++hosts
+ 
+-# ملفات Ansible المؤقتة
++# Ansible artefacts
+ *.retry
++.vault_pass
++*.vault
++
++# Docker temporary files
++*.tar
+ 
+-# ملفات النظام
++# OS / editor
+ .DS_Store
+ *.swp
+ *~
+diff --git a/Jenkinsfile b/Jenkinsfile
+index a6677ab..2a85d49 100644
+--- a/Jenkinsfile
++++ b/Jenkinsfile
+@@ -1,53 +1,75 @@
+-pipeline {
+-    agent any
+-
+-    stages {
+-
+-        stage('Checkout Source Code') {
+-            steps {
+-                echo "Downloading source code..."
+-                checkout scm
+-            }
+-        }
+-
+-        stage('Show Workspace') {
+-            steps {
+-                echo "Workspace contents:"
+-                sh 'pwd'
+-                sh 'ls -lah'
+-            }
+-        }
+-
+-        stage('Run Ansible Playbooks') {
+-            steps {
+-                echo "Installing Docker..."
+-                sh 'ansible-playbook install-docker.yml'
+-
+-                echo "Deploying Web Application..."
+-                sh 'ansible-playbook deploy-webapp.yml'
+-            }
+-        }
+-
+-        stage('Verification') {
+-            steps {
+-                echo "Checking Docker containers..."
+-                sh 'docker ps'
+-            }
+-        }
+-    }
+-
+-    post {
+-
+-        success {
+-            echo "Pipeline completed successfully."
+-        }
+-
+-        failure {
+-            echo "Pipeline failed."
+-        }
+-
+-        always {
+-            echo "Pipeline execution finished."
+-        }
+-    }
+-}
++pipeline {
++    agent any
++
++    parameters {
++        string(name: 'INVENTORY', defaultValue: '/etc/ansible/inventory.ini',
++               description: 'Path to the real inventory on the Jenkins agent. Host addresses and SSH users are environment-specific and are never committed to this repository - see inventory.example.ini for the expected structure.')
++    }
++
++    stages {
++
++        stage('Checkout Source Code') {
++            steps {
++                echo "Downloading source code..."
++                checkout scm
++            }
++        }
++
++        stage('Show Workspace') {
++            steps {
++                echo "Workspace contents:"
++                sh 'pwd'
++                sh 'ls -lah'
++            }
++        }
++
++        stage('Preflight') {
++            steps {
++                echo "Checking inventory and reachability..."
++                sh """
++                    set -eu
++                    if [ ! -f "${params.INVENTORY}" ]; then
++                        echo "Inventory not found: ${params.INVENTORY}"
++                        echo "Copy inventory.example.ini to that path on this agent and fill it in."
++                        exit 1
++                    fi
++                    ansible -i "${params.INVENTORY}" production -m ping
++                """
++            }
++        }
++
++        stage('Run Ansible Playbooks') {
++            steps {
++                echo "Installing Docker..."
++                sh "ansible-playbook -i '${params.INVENTORY}' install-docker.yml"
++
++                echo "Deploying Web Application..."
++                sh "ansible-playbook -i '${params.INVENTORY}' deploy-webapp.yml"
++            }
++        }
++
++        stage('Verification') {
++            steps {
++                // Run against the managed hosts, not the Jenkins agent. The agent
++                // does not run the container, so 'docker ps' here verified nothing.
++                echo "Checking containers across the fleet..."
++                sh "ansible -i '${params.INVENTORY}' production -a 'docker ps'"
++            }
++        }
++    }
++
++    post {
++
++        success {
++            echo "Pipeline completed successfully."
++        }
++
++        failure {
++            echo "Pipeline failed."
++        }
++
++        always {
++            echo "Pipeline execution finished."
++        }
++    }
++}
+diff --git a/README.md b/README.md
+index 0807fa6..52cc06f 100644
+--- a/README.md
++++ b/README.md
+@@ -78,6 +78,8 @@ second play needs a working Docker daemon on every host.
+ 
+ ```
+ containerization-with-Ansible/
++├── ansible.cfg                 # inventory path, roles path, become defaults
++├── inventory.example.ini       # copy to inventory.ini and fill in
+ ├── install-docker.yml          # phase 1 — Docker CE on every host
+ ├── deploy-webapp.yml           # phase 2 — the web container
+ ├── roles/
+@@ -108,24 +110,26 @@ containerization-with-Ansible/
+ 
+ ## Inventory
+ 
+-The inventory is **not committed** to this repository, so the playbooks will not run
+-immediately after a clone. Both plays expect a group named `production`. Create one:
++An example inventory ships with the repository. Real inventories stay out of Git, because
++host addresses and SSH users are environment-specific.
+ 
+-```ini
+-# inventory.ini
+-[production]
+-rocky   ansible_host=192.168.x.x
+-ubuntu  ansible_host=192.168.x.x
+-test    ansible_host=192.168.x.x
+-
+-[production:vars]
+-ansible_user=<your-ssh-user>
++```bash
++cp inventory.example.ini inventory.ini
++# edit inventory.ini: real addresses, your SSH user, your key path
+ ```
+ 
+-Then confirm the control node can reach everything before running anything that changes state:
++Both plays target the group `production` and run with `become: true`, so the SSH user needs
++passwordless sudo on every host. Authentication is by SSH key - there is no password field.
++
++`ansible.cfg` sets `inventory = ./inventory.ini`, so once that file exists the `-i` flag is
++optional. It also sets `host_key_checking = False`, which is what allows an unattended run
++against freshly provisioned VMs whose host keys are not yet known; remove that line when
++running against hosts you have already accepted.
++
++Confirm the control node can reach everything before running anything that changes state:
+ 
+ ```bash
+-ansible -i inventory.ini production -m ping
++ansible production -m ping
+ ```
+ 
+ ---
+@@ -136,21 +140,29 @@ Manually, in order:
+ 
+ ```bash
+ # phase 1 — install Docker CE on every host
+-ansible-playbook -i inventory.ini install-docker.yml
++ansible-playbook install-docker.yml
+ 
+ # phase 2 — deploy the web container
+-ansible-playbook -i inventory.ini deploy-webapp.yml
++ansible-playbook deploy-webapp.yml
+ ```
+ 
+ Preview the changes without applying them:
+ 
+ ```bash
+-ansible-playbook -i inventory.ini install-docker.yml --check --diff
++ansible-playbook install-docker.yml --check --diff
++```
++
++Override the deployed image without editing the role:
++
++```bash
++ansible-playbook deploy-webapp.yml -e webapp_image=alnaqib/efe-egy-web:1.0
+ ```
+ 
+-Through Jenkins, the pipeline runs both playbooks in sequence and then verifies the result.
+-The Jenkins agent needs the same Ansible installation and SSH access as a manual control node —
+-the pipeline does not provision either.
++Through Jenkins, the pipeline pings the fleet first, then runs both playbooks in sequence and
++verifies the result across the managed hosts. The inventory path is a build parameter
++(`INVENTORY`, default `/etc/ansible/inventory.ini`) because the real inventory lives on the
++agent, not in this repository. The Jenkins agent needs the same Ansible installation and SSH
++access as a manual control node — the pipeline does not provision either.
+ 
+ ---
+ 
+@@ -162,7 +174,7 @@ docker ps
+ curl -I http://localhost:8080
+ 
+ # from the control node, across the whole group
+-ansible -i inventory.ini production -a "docker ps"
++ansible production -a "docker ps"
+ ```
+ 
+ A successful run leaves one container per host, serving the site on port 8080.
+@@ -181,10 +193,12 @@ from Docker Hub without registry credentials.
+ 
+ Stated plainly, because they matter if anyone runs this against real machines:
+ 
+-- **No inventory in the repository.** Deliberate — host addresses and SSH users are
+-  environment-specific — but it means the repository is not runnable as cloned.
+-- **The image tag is fixed in the role**, not passed as a variable. Deploying a different
+-  version means editing the role rather than overriding a variable at run time.
++- **No real inventory in the repository.** `inventory.example.ini` shows the expected
++  structure, but host addresses and SSH users are environment-specific and stay out of Git.
++  You must create `inventory.ini` from it before anything runs.
++- **The image tag defaults to `:latest`.** `webapp_image` is a role default and *can* be
++  overridden at run time (`-e webapp_image=...`), but a moving default tag means two runs a
++  week apart can deploy different images.
+ - **Port 8080 is hardcoded.** Fine for one container per host; it would collide if the same
+   host ever needed two.
+ - **The Jenkins pipeline has no rollback.** If phase 2 fails partway through, some hosts will
+diff --git a/ansible.cfg b/ansible.cfg
+new file mode 100644
+index 0000000..6299a68
+--- /dev/null
++++ b/ansible.cfg
+@@ -0,0 +1,16 @@
++[defaults]
++inventory           = ./inventory.ini
++roles_path          = ./roles
++retry_files_enabled = False
++stdout_callback     = yaml
++interpreter_python  = auto_silent
++
++# Disabled because the managed hosts are freshly provisioned lab VMs whose
++# host keys are not known in advance, and because the Jenkins agent runs these
++# playbooks unattended. Remove this line when running against hosts whose keys
++# you have already accepted.
++host_key_checking   = False
++
++[privilege_escalation]
++become        = True
++become_method = sudo
+diff --git a/inventory.example.ini b/inventory.example.ini
+new file mode 100644
+index 0000000..2ca637e
+--- /dev/null
++++ b/inventory.example.ini
+@@ -0,0 +1,24 @@
++# =====================================================================
++#  Example inventory - copy to inventory.ini and fill in real values.
++#
++#      cp inventory.example.ini inventory.ini
++#
++#  inventory.ini is git-ignored. Never commit real addresses or users.
++#  The addresses below are RFC 5737 documentation addresses and are
++#  deliberately unroutable, so this file cannot reach anything.
++#
++#  Both playbooks target the group [production] and run with become: true,
++#  so the SSH user needs passwordless sudo on every host.
++#
++#  Authentication is by SSH key only. Do not add ansible_password here.
++# =====================================================================
++
++[production]
++rocky   ansible_host=192.0.2.11
++ubuntu  ansible_host=192.0.2.12
++test    ansible_host=192.0.2.13
++
++[production:vars]
++ansible_user=REPLACE_ME
++ansible_ssh_private_key_file=~/.ssh/REPLACE_ME.pem
++ansible_python_interpreter=/usr/bin/python3
+diff --git a/roles/webapp/tasks/main.yml b/roles/webapp/tasks/main.yml
+index fe57c54..16d24ee 100644
+--- a/roles/webapp/tasks/main.yml
++++ b/roles/webapp/tasks/main.yml
+@@ -1,8 +1,8 @@
+ ---
+ # roles/webapp/tasks/main.yml
+-# نشر موقع EFE-EGY كـ container على كل الماشينات
++# Deploy the EFE-EGY site as a container on every managed host
+ 
+-# ---- تجهيز Docker SDK for Python (مطلوب لموديول docker_container) ----
++# ---- Docker SDK for Python (required by the docker_container module) ----
+ - name: Install Docker SDK for Python (Debian)
+   ansible.builtin.apt:
+     name: python3-docker
+@@ -10,8 +10,8 @@
+     update_cache: true
+   when: ansible_os_family == "Debian"
+ 
+-# على RedHat نعزل الـ SDK في virtualenv عشان نتجنب تعارض
+-# نسخ المكتبات مع حزم النظام
++# On RedHat the SDK is isolated in a virtualenv to avoid version conflicts
++# between the pip-installed libraries and the system packages
+ - name: Install pip and virtualenv (RedHat)
+   ansible.builtin.dnf:
+     name:
+@@ -30,7 +30,7 @@
+     virtualenv_command: python3 -m venv
+   when: ansible_os_family == "RedHat"
+ 
+-# ---- نشر الـ container ----
++# ---- Deploy the container ----
+ - name: Run the efe-egy-web container
+   community.docker.docker_container:
+     name: "{{ webapp_container_name }}"
+@@ -48,4 +48,4 @@
+ 
+ - name: Show access URL
+   ansible.builtin.debug:
+-    msg: "الموقع شغّال على  http://{{ ansible_host | default(inventory_hostname) }}:{{ webapp_host_port }}"
++    msg: "Site is live at http://{{ ansible_host | default(inventory_hostname) }}:{{ webapp_host_port }}"

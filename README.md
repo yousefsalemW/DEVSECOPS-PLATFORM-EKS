@@ -112,7 +112,7 @@ SonarQube       static analysis + quality gate
    ↓
 Build           5 Docker images
    ↓
-Trivy Scan      vulnerability scan + CycloneDX SBOM per image
+Trivy Scan      vulnerability GATE + CycloneDX SBOM per image (fails on fixable HIGH/CRITICAL)
    ↓
 ECR Login       authenticate to the registry
    ↓
@@ -147,7 +147,7 @@ Assume Platform Role → Connect → Report → Approval gate → Deploy
 | **Network segmentation** | 6 NetworkPolicies: default-deny both directions, explicit allows only. Enforcement enabled via `vpc-cni` `enableNetworkPolicy`. |
 | **Secrets at rest** | EKS secret encryption with a customer-managed KMS key. No credential values in Git — the chart refuses to render without externally-created Secrets. |
 | **Container hardening** | All 6 containers: `allowPrivilegeEscalation: false`, `drop: ALL`, `seccompProfile: RuntimeDefault`. Non-root where the image permits. |
-| **Supply chain** | Trivy scan before ECR login; CycloneDX SBOM archived per image per build. |
+| **Supply chain** | Trivy gate before ECR login — fixable HIGH/CRITICAL findings fail the build, so a vulnerable image never reaches the registry. Accepted risks are recorded with written justification in `Build-Images/.trivyignore`. CycloneDX SBOM archived per image per build. |
 | **Access** | Jenkins reached via SSM Session Manager. No bastion, no SSH key, no open port 22. |
 
 

@@ -1,0 +1,29 @@
+diff --git a/README.md b/README.md
+index dff0c9d..71250d5 100644
+--- a/README.md
++++ b/README.md
+@@ -36,7 +36,7 @@ The application servers never receive traffic from the internet directly. Reques
+ | **Compute** | 2 × EC2 instances running Apache Tomcat 9, bastion host, Application Load Balancer with a target group |
+ | **Managed services** | Amazon RDS (MySQL 8.0), Amazon MQ (RabbitMQ), Amazon ElastiCache (Memcached) |
+ | **DNS** | Route 53 private hosted zone with records for the database, broker and cache endpoints |
+-| **Security & identity** | Security groups per tier, IAM roles and instance profiles, bastion-only administrative access |
++| **Security & identity** | Security groups per tier chained by group reference rather than CIDR, bastion-only administrative access, no public IPs on application instances |
+ 
+ ---
+ 
+@@ -137,12 +137,14 @@ terraform destroy
+ - One security group per tier, each opening only the port the tier above it requires
+ - Bastion host as the single administrative entry point
+ - Outbound-only internet access from private subnets, through the NAT Gateway
+-- IAM roles and instance profiles rather than access keys on instances
++- No IAM roles or instance profiles are created by this configuration, and none are needed: nothing in this stack calls an AWS API from an instance, so the instances hold no AWS credentials of any kind
+ 
+ **Not yet implemented**
+ 
+ - HTTPS — the load balancer serves HTTP; ACM and a TLS listener are on the roadmap
+ - Secrets management — database credentials are passed as Terraform variables, not through Secrets Manager or SSM Parameter Store
++- IAM — no roles or instance profiles are provisioned. If the application later needs to reach S3, SSM Parameter Store or Secrets Manager, an instance profile with a scoped policy is the correct way to grant it, not access keys in user data. An SSM Session Manager profile would also remove the need for the bastion entirely
++- Remote state — state is local. An S3 backend with native locking is the next step before this configuration is shared
+ - Remote state with locking
+ - VPC Flow Logs, CloudTrail and GuardDuty
+ 

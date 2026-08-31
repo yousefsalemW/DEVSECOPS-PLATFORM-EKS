@@ -199,13 +199,40 @@ def scanImage(img) {
     """
 
     // (c) Security gate — fails the build on fixable findings at GATE_SEVERITY.
+    //
+    //     trivy exit-code contract as used here:
+    //       0  clean at GATE_SEVERITY      -> continue to ECR Login
+    //       2  findings at GATE_SEVERITY   -> policy failure, stop before ECR
+    //       1  trivy itself failed         -> tooling failure, stop
+    //
+    //     2 is chosen for policy because trivy already returns 1 for its own
+    //     operational errors. If the gate also returned 1, a corrupt cache and a
+    //     critical CVE would be indistinguishable in the console, and the usual
+    //     reaction to a gate that fails for unclear reasons is to switch it off.
+    //
+    //     Without an explicit --exit-code, trivy defaults to 0 and this block
+    //     reports findings without ever failing the build.
     if (params.SECURITY_GATE) {
-        sh """
-            trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
-              --ignorefile ${env.TRIVY_IGNOREFILE} \
-              --no-progress --ignore-unfixed --skip-db-update \
-              --severity ${params.GATE_SEVERITY} ${ref}
-        """
+        def rc = sh(
+            returnStatus: true,
+            script: """
+                trivy image --cache-dir ${env.TRIVY_CACHE_DIR} \
+                  --ignorefile ${env.TRIVY_IGNOREFILE} \
+                  --no-progress --ignore-unfixed --skip-db-update \
+                  --exit-code 2 \
+                  --severity ${params.GATE_SEVERITY} ${ref}
+            """
+        )
+        if (rc == 2) {
+            error("SECURITY GATE FAILED for ${ref}: fixable ${params.GATE_SEVERITY} findings present. " +
+                  "See the archived trivy-${img.name}.txt for the full list. " +
+                  "Fix the dependency or base image, or record an accepted risk with a written " +
+                  "justification in Build-Images/.trivyignore. Do not lower GATE_SEVERITY.")
+        } else if (rc != 0) {
+            error("Trivy failed to scan ${ref} (exit ${rc}). This is a scanner, cache or " +
+                  "database problem, not a vulnerability finding.")
+        }
+        echo "Security gate PASSED for ${ref} — no fixable ${params.GATE_SEVERITY} findings"
     }
 }
 

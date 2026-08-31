@@ -1,0 +1,295 @@
+diff --git a/README.md b/README.md
+index a8bb112..bdf893b 100644
+--- a/README.md
++++ b/README.md
+@@ -65,11 +65,13 @@ built and secured — by hand, without a managed control plane.
+ - **One load balancer, two jobs.** The same HAProxy VM fronts the application on `:80`
+   *and* the Kubernetes API on `:6443`. That is what makes the control plane highly
+   available.
+-- **Credential-free images.** The WAR is built with no password in it; the real
+-  `application.properties` is mounted at runtime from a Secret, so the image is safe to
++- **No credentials in any image.** `application.properties` ships with Spring
++  placeholders; the real values arrive as environment variables from a Kubernetes Secret at
++  startup. The db and broker images carry no credentials either, so all four are safe to
+   push to a public registry.
+-- **A scan gate before the registry.** Trivy runs on every image and a HIGH/CRITICAL
+-  finding stops the push, not the deploy.
++- **A scan gate before the registry.** Trivy scans every image and a fixable HIGH/CRITICAL
++  finding aborts the run before `docker push`, so a vulnerable image never reaches Docker
++  Hub. `GATE=0` drops back to audit mode: scan, report, push anyway.
+ - **Workload-aware update strategies.** `Recreate` for the `ReadWriteOnce` database,
+   `RollingUpdate` for the stateless app — chosen for a reason, documented below.
+ 
+@@ -125,11 +127,11 @@ Vprofile-Secured-Orchestrator/
+ │   └── rabbitmq/
+ ├── k8s/                        # manifests, numbered in apply order
+ │   ├── 00-namespace.yaml
+-│   ├── 01-secret.yaml          # db + rmq credentials
++│   ├── 01-secret.example.yaml  # template - real Secret created out of band
+ │   ├── 02-db.yaml              # PVC + Deployment + Service (db01)
+ │   ├── 03-memcached.yaml
+ │   ├── 04-rabbitmq.yaml
+-│   └── 05-app.yaml             # app-config Secret + Deployment + NodePort (app01)
++│   └── 05-app.yaml             # Deployment (Secret-backed env) + NodePort (app01)
+ ├── haproxy/vprofile.cfg        # frontend/backend for the HAProxy VM
+ ├── docs/                       # architecture diagrams
+ └── VProfile-Kubernetes-ALnaqib.pptx
+@@ -229,8 +231,9 @@ sudo haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy
+ 
+ Default login: **`admin_vp` / `admin_vp`**.
+ 
+-> These are demo credentials committed for reproducibility. Replace every password in
+-> `k8s/01-secret.yaml` before any real use.
++> `admin_vp` is a demo account seeded by `db_backup.sql`, not an infrastructure credential.
++> Infrastructure passwords are not committed at all - create the `app-secret` Secret from
++> `k8s/01-secret.example.yaml` with values of your own.
+ 
+ ---
+ 
+@@ -243,11 +246,13 @@ in this repo; the rest are the deliberate next steps, listed so the model is com
+ 
+ **Implemented**
+ 
+-1. **Credential-free images.** The app WAR is built with **no password**; the real
+-   `application.properties` is mounted at runtime from a Secret. The image is generic and
+-   safe to store in a public registry.
+-2. **Single-source Secret.** One object holds the credentials, so everything below it
+-   actually has something to protect.
++1. **No credentials in any image.** The app WAR is built with placeholders and resolves
++   `JDBC_USERNAME`, `JDBC_PASSWORD`, `RABBITMQ_USERNAME` and `RABBITMQ_PASSWORD` from the
++   `app-secret` Secret at runtime. db01 and rmq01 read the same Secret via `secretKeyRef`.
++   No image in this repository contains a password.
++2. **Single-source Secret.** One object holds the credentials for all three tiers, so
++   rotating a password is a single edit. The Secret is created out of band and never
++   committed - `k8s/01-secret.example.yaml` documents the required keys.
+ 3. **Hardened builds.** Multi-stage Dockerfiles, non-root users, pinned base versions, and
+    a **Trivy** scan for HIGH/CRITICAL before every push.
+ 
+diff --git a/build-and-push.sh b/build-and-push.sh
+index 0ba6b7b..4ebb1d8 100644
+--- a/build-and-push.sh
++++ b/build-and-push.sh
+@@ -16,13 +16,46 @@ docker build --platform "$PLATFORM" -t "$DHUB/vprofile-db:$TAG"  -f images/db/Do
+ docker build --platform "$PLATFORM" -t "$DHUB/vprofile-mc:$TAG"  -f images/memcached/Dockerfile images/memcached/
+ docker build --platform "$PLATFORM" -t "$DHUB/vprofile-rmq:$TAG" -f images/rabbitmq/Dockerfile  images/rabbitmq/
+ 
+-# 2) scan (fail the build on HIGH/CRITICAL if you drop '|| true')
++# 2) scan — this is a GATE, not a report.
++#    trivy exit codes as used here:
++#      0 = clean at severity | 2 = findings at severity | 1 = trivy itself failed
++#    Two things were needed to make this enforce: removing '|| true' (which
++#    substitutes exit 0 and defeats `set -e`) AND adding --exit-code, because
++#    trivy defaults to --exit-code 0 and would otherwise never signal findings.
++#    All four images are scanned before any decision, so the operator sees the
++#    complete picture rather than stopping at the first failure.
++#    GATE=0 falls back to audit mode: scan, report, push anyway.
++GATE="${GATE:-1}"
++FAILED=""
++
+ for s in app db mc rmq; do
+   echo "== scanning $s =="
+-  trivy image --severity HIGH,CRITICAL --ignore-unfixed "$DHUB/vprofile-$s:$TAG" || true
++  set +e
++  trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 2 \
++    "$DHUB/vprofile-$s:$TAG"
++  rc=$?
++  set -e
++  case "$rc" in
++    0) echo "   clean" ;;
++    2) echo "   FINDINGS at HIGH/CRITICAL"; FAILED="$FAILED $s" ;;
++    *) echo "   trivy failed to scan (exit $rc)"; FAILED="$FAILED $s(scan-error)" ;;
++  esac
+ done
+ 
+-# 3) push
++if [ -n "$FAILED" ] && [ "$GATE" = "1" ]; then
++  echo
++  echo "SECURITY GATE FAILED - no images pushed."
++  echo "Affected:$FAILED"
++  echo "Fix the base image or dependency, then re-run."
++  echo "To scan and push anyway (audit mode):  GATE=0 ./build-and-push.sh"
++  exit 2
++fi
++
++if [ -n "$FAILED" ]; then
++  echo "WARNING: pushing despite findings because GATE=0 -$FAILED"
++fi
++
++# 3) push - only reached when the gate passed, or was explicitly disabled
+ docker login -u "$DHUB"
+ for s in app db mc rmq; do docker push "$DHUB/vprofile-$s:$TAG"; done
+ echo "done."
+diff --git a/deploy.sh b/deploy.sh
+index b528a53..27571da 100644
+--- a/deploy.sh
++++ b/deploy.sh
+@@ -10,7 +10,22 @@ kubectl patch storageclass local-path \
+ 
+ # 2) app stack (order matters: ns -> secret -> backing services -> app)
+ kubectl apply -f k8s/00-namespace.yaml
+-kubectl apply -f k8s/01-secret.yaml
++
++# The Secret is created out of band, never committed. k8s/01-secret.example.yaml
++# documents the required keys; see the README for the create command.
++if ! kubectl -n vprofile get secret app-secret >/dev/null 2>&1; then
++  echo "ERROR: Secret 'app-secret' not found in namespace vprofile."
++  echo "Create it first - see k8s/01-secret.example.yaml or the README:"
++  echo
++  echo "  kubectl -n vprofile create secret generic app-secret \\"
++  echo "    --from-literal=db-root-password=\"\$(openssl rand -base64 24)\" \\"
++  echo "    --from-literal=db-user=vprofile \\"
++  echo "    --from-literal=db-password=\"\$(openssl rand -base64 24)\" \\"
++  echo "    --from-literal=rmq-user=vprofile \\"
++  echo "    --from-literal=rmq-password=\"\$(openssl rand -base64 24)\""
++  exit 1
++fi
++
+ kubectl apply -f k8s/02-db.yaml
+ kubectl apply -f k8s/03-memcached.yaml
+ kubectl apply -f k8s/04-rabbitmq.yaml
+diff --git a/images/app/Dockerfile b/images/app/Dockerfile
+index ed29c43..3011dd9 100644
+--- a/images/app/Dockerfile
++++ b/images/app/Dockerfile
+@@ -11,25 +11,35 @@ WORKDIR /workspace
+ COPY pom.xml .
+ COPY src ./src
+ 
+-# service hostnames + credentials injected at build time (NOT hard-coded)
++# Service hostnames only. Hostnames are cluster topology, not secrets, so they
++# are safe to bake into the image.
++#
++# Credentials are deliberately NOT build arguments. Anything written into
++# application.properties before `mvn package` is compiled into the WAR, and the
++# WAR is copied into the runtime stage below - so a build-arg credential ends up
++# in the published image filesystem, not merely in build history. Multi-stage
++# does not help with that.
++#
++# Instead the properties file ships with Spring placeholders and the real values
++# arrive as environment variables at runtime, sourced from the Kubernetes Secret
++# `app-secret` (see k8s/05-app.yaml).
+ ARG DB_HOST=db01.vprofile
+-ARG DB_USER=admin
+-ARG DB_PASS=admin123
+ ARG MC_HOST=mc01.vprofile
+ ARG RMQ_HOST=rmq01.vprofile
+-ARG RMQ_USER=vprofile
+-ARG RMQ_PASS=guest
+ 
+-# rewrite application.properties to point at the k8s Services, then build
+ RUN set -eux; p=src/main/resources/application.properties; \
+-    sed -i "s#jdbc:mysql://db01:#jdbc:mysql://${DB_HOST}:#"            "$p"; \
+-    sed -i "s#^jdbc.username=.*#jdbc.username=${DB_USER}#"            "$p"; \
+-    sed -i "s#^jdbc.password=.*#jdbc.password=${DB_PASS}#"            "$p"; \
++    sed -i "s#jdbc:mysql://db01:#jdbc:mysql://${DB_HOST}:#"                   "$p"; \
+     sed -i "s#memcached.active.host=mc01#memcached.active.host=${MC_HOST}#"   "$p"; \
+     sed -i "s#memcached.standBy.host=mc01#memcached.standBy.host=${MC_HOST}#" "$p"; \
+-    sed -i "s#rabbitmq.address=rmq01#rabbitmq.address=${RMQ_HOST}#"    "$p"; \
+-    sed -i "s#^rabbitmq.username=.*#rabbitmq.username=${RMQ_USER}#"    "$p"; \
+-    sed -i "s#^rabbitmq.password=.*#rabbitmq.password=${RMQ_PASS}#"    "$p"; \
++    sed -i "s#rabbitmq.address=rmq01#rabbitmq.address=${RMQ_HOST}#"           "$p"; \
++    sed -i "s#^jdbc.username=.*#jdbc.username=\${JDBC_USERNAME}#"             "$p"; \
++    sed -i "s#^jdbc.password=.*#jdbc.password=\${JDBC_PASSWORD}#"             "$p"; \
++    sed -i "s#^rabbitmq.username=.*#rabbitmq.username=\${RABBITMQ_USERNAME}#" "$p"; \
++    sed -i "s#^rabbitmq.password=.*#rabbitmq.password=\${RABBITMQ_PASSWORD}#" "$p"; \
++    echo "--- credential lines after substitution (must show placeholders) ---"; \
++    grep -E "^(jdbc|rabbitmq)\.(username|password)=" "$p"; \
++    grep -qE "^jdbc\.password=\\$\{JDBC_PASSWORD\}$" "$p"; \
++    grep -qE "^rabbitmq\.password=\\$\{RABBITMQ_PASSWORD\}$" "$p"; \
+     mvn -q -B clean package -DskipTests
+ 
+ # ---------- Stage 2: minimal runtime ----------
+diff --git a/k8s/01-secret.example.yaml b/k8s/01-secret.example.yaml
+new file mode 100644
+index 0000000..63f754b
+--- /dev/null
++++ b/k8s/01-secret.example.yaml
+@@ -0,0 +1,35 @@
++# -------------------------------------------------------------------
++#  EXAMPLE ONLY - do not apply as-is, and never commit real values.
++#
++#  One Secret feeds db01, rmq01 AND app01 at runtime. Because the app
++#  image carries no credentials, this Secret is the single source of
++#  truth: change a value here and every tier follows on restart.
++#
++#  Create the real object out of band:
++#
++#    kubectl -n vprofile create secret generic app-secret \
++#      --from-literal=db-root-password="$(openssl rand -base64 24)" \
++#      --from-literal=db-user=vprofile \
++#      --from-literal=db-password="$(openssl rand -base64 24)" \
++#      --from-literal=rmq-user=vprofile \
++#      --from-literal=rmq-password="$(openssl rand -base64 24)"
++#
++#  Keys consumed by:
++#    db-root-password -> db01  (MYSQL_ROOT_PASSWORD)
++#    db-user          -> db01  (MYSQL_USER)      + app01 (JDBC_USERNAME)
++#    db-password      -> db01  (MYSQL_PASSWORD)  + app01 (JDBC_PASSWORD)
++#    rmq-user         -> rmq01 (RABBITMQ_DEFAULT_USER) + app01 (RABBITMQ_USERNAME)
++#    rmq-password     -> rmq01 (RABBITMQ_DEFAULT_PASS) + app01 (RABBITMQ_PASSWORD)
++# -------------------------------------------------------------------
++apiVersion: v1
++kind: Secret
++metadata:
++  name: app-secret
++  namespace: vprofile
++type: Opaque
++stringData:
++  db-root-password: "REPLACE_ME"
++  db-user: "REPLACE_ME"
++  db-password: "REPLACE_ME"
++  rmq-user: "REPLACE_ME"
++  rmq-password: "REPLACE_ME"
+diff --git a/k8s/01-secret.yaml b/k8s/01-secret.yaml
+deleted file mode 100644
+index 9627482..0000000
+--- a/k8s/01-secret.yaml
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# -------------------------------------------------------------------
+-#  One Secret feeds the DB + RabbitMQ containers at runtime.
+-#  IMPORTANT: db-user/db-password/rmq-user/rmq-password MUST match the
+-#  --build-arg values you baked into the APP image, otherwise the app
+-#  will authenticate with the wrong credentials.
+-#  (stringData = plain text now, kubernetes base64-encodes it for you)
+-# -------------------------------------------------------------------
+-apiVersion: v1
+-kind: Secret
+-metadata:
+-  name: app-secret
+-  namespace: vprofile
+-type: Opaque
+-stringData:
+-  db-root-password: "ChangeMe_Root_123"
+-  db-user: "admin"
+-  db-password: "admin123"
+-  rmq-user: "vprofile"
+-  rmq-password: "guest"
+diff --git a/k8s/05-app.yaml b/k8s/05-app.yaml
+index 118b6c3..78afe76 100644
+--- a/k8s/05-app.yaml
++++ b/k8s/05-app.yaml
+@@ -25,9 +25,22 @@ spec:
+           command: ['sh','-c','until nc -z rmq01 5672; do echo "waiting for rmq01"; sleep 3; done']
+       containers:
+         - name: vpro-app
+-          image: alnaqib/vprofile-app:1.0
++          image: alnaqib/vprofile-app:1.1
+           ports:
+             - containerPort: 8080
++          # Credentials are NOT in the image. application.properties ships with
++          # Spring placeholders and these env vars resolve them at startup, from
++          # the same Secret that already feeds db01 and rmq01 - one source of
++          # truth for every tier.
++          env:
++            - name: JDBC_USERNAME
++              valueFrom: { secretKeyRef: { name: app-secret, key: db-user } }
++            - name: JDBC_PASSWORD
++              valueFrom: { secretKeyRef: { name: app-secret, key: db-password } }
++            - name: RABBITMQ_USERNAME
++              valueFrom: { secretKeyRef: { name: app-secret, key: rmq-user } }
++            - name: RABBITMQ_PASSWORD
++              valueFrom: { secretKeyRef: { name: app-secret, key: rmq-password } }
+           readinessProbe:
+             httpGet: { path: /, port: 8080 }
+             initialDelaySeconds: 40
